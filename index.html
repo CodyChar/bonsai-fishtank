@@ -121,8 +121,8 @@
       </div>
       <div class="slider-row">
         <span>Scene Z</span>
-        <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.25">
-        <code id="scene-z-val">-0.25</code>
+        <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.10">
+        <code id="scene-z-val">-0.10</code>
       </div>
       <div class="slider-row">
         <span>Scene scale</span>
@@ -136,7 +136,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 scene scale slider</div>
+    <div id="build-stamp">Build 2026-04-14 props + petals + 4" depth</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -392,6 +392,135 @@
       const bonsaiGroup = new THREE.Group();
       diorama.add(bonsaiGroup);
       buildPrimitiveBonsai(bonsaiGroup);
+
+      // -------------------- Props --------------------
+      // Moss tuft on the pedestal — flattened sphere with mossy green.
+      const moss = new THREE.Mesh(
+        new THREE.SphereGeometry(0.16, 24, 16),
+        new THREE.MeshStandardMaterial({ color: 0x4f6b2e, roughness: 1.0 })
+      );
+      moss.scale.set(1, 0.18, 1);
+      moss.position.y = -0.155;
+      moss.receiveShadow = true;
+      diorama.add(moss);
+
+      // Scattered rocks — a fixed seed pattern so the layout is stable
+      // between reloads. Slight color variance keeps them from looking
+      // identical.
+      function mulberry32(a) {
+        return function () {
+          let t = a += 0x6D2B79F5;
+          t = Math.imul(t ^ (t >>> 15), t | 1);
+          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+      const rng = mulberry32(0x42beef);
+      const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+      for (let i = 0; i < 9; i++) {
+        const tint = 0.55 + rng() * 0.25;
+        const rock = new THREE.Mesh(
+          rockGeo,
+          new THREE.MeshStandardMaterial({
+            color: new THREE.Color(tint, tint * 0.95, tint * 0.88),
+            roughness: 0.9,
+            flatShading: true
+          })
+        );
+        const r = 0.22 + rng() * 0.35;
+        const a = rng() * Math.PI * 2;
+        rock.position.set(Math.cos(a) * r, -0.18, Math.sin(a) * r);
+        rock.scale.set(0.025 + rng() * 0.04, 0.018 + rng() * 0.025, 0.025 + rng() * 0.04);
+        rock.rotation.set(rng() * Math.PI, rng() * Math.PI, rng() * Math.PI);
+        rock.castShadow = true;
+        rock.receiveShadow = true;
+        diorama.add(rock);
+      }
+
+      // A small ceramic dish under the bonsai — sits between the moss
+      // and the pedestal lip so it reads as the pot rim.
+      const dish = new THREE.Mesh(
+        new THREE.TorusGeometry(0.17, 0.012, 12, 48),
+        new THREE.MeshStandardMaterial({ color: 0xece2cf, roughness: 0.35, metalness: 0.1 })
+      );
+      dish.rotation.x = Math.PI / 2;
+      dish.position.y = -0.158;
+      dish.castShadow = true;
+      dish.receiveShadow = true;
+      diorama.add(dish);
+
+      // -------------------- Drifting petals --------------------
+      // Cherry-blossom-coloured instanced quads with a fall + sway
+      // animation done entirely in the vertex shader. Each instance
+      // wraps vertically so the system never depletes.
+      const PETAL_COUNT = 90;
+      const petalGeo = new THREE.PlaneGeometry(0.012, 0.012);
+      const petalSeeds = new Float32Array(PETAL_COUNT);
+      for (let i = 0; i < PETAL_COUNT; i++) petalSeeds[i] = Math.random();
+      petalGeo.setAttribute('aSeed', new THREE.InstancedBufferAttribute(petalSeeds, 1));
+
+      const petalMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        uniforms: { uTime: { value: 0 } },
+        vertexShader: `
+          uniform float uTime;
+          attribute float aSeed;
+          varying vec2 vUv;
+          varying float vTilt;
+          void main() {
+            vUv = uv;
+            float t = uTime * 0.18 + aSeed * 6.283;
+            // Wrap-around fall: petal Y decreases over time, modulo 0.7
+            float fallY = mod(0.4 - t * 0.5, 0.7) - 0.18;
+            float swayX = sin(t * 1.3 + aSeed * 9.0) * 0.05;
+            float swayZ = cos(t * 0.9 + aSeed * 5.0) * 0.05;
+            vec3 offset = vec3(swayX, fallY, swayZ);
+
+            // Per-petal billboard tilt so they look like real flat petals
+            // catching light at varied angles instead of facing the cam.
+            float ang = aSeed * 6.283 + uTime * 0.4;
+            mat3 tilt = mat3(
+              cos(ang), 0.0, sin(ang),
+              0.0, 1.0, 0.0,
+              -sin(ang), 0.0, cos(ang)
+            );
+            vec3 pos = tilt * vec3(position.x, position.y, 0.0);
+            vTilt = tilt[0].z;
+
+            vec4 mv = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+            mv.xyz += offset;
+            vec4 world = modelMatrix * mv;
+            gl_Position = projectionMatrix * viewMatrix * (world + vec4(pos, 0.0));
+          }`,
+        fragmentShader: `
+          varying vec2 vUv;
+          varying float vTilt;
+          void main() {
+            vec2 d = vUv - vec2(0.5);
+            // Petal-ish profile: longer than wide
+            float r = d.x*d.x*4.0 + d.y*d.y*1.6;
+            float a = smoothstep(1.0, 0.2, r);
+            vec3 col = mix(vec3(1.0, 0.78, 0.85), vec3(1.0, 0.92, 0.96), 0.5 + 0.5 * vTilt);
+            gl_FragColor = vec4(col, a * 0.85);
+          }`
+      });
+
+      const petalMesh = new THREE.InstancedMesh(petalGeo, petalMat, PETAL_COUNT);
+      petalMesh.frustumCulled = false;
+      {
+        const dummy = new THREE.Object3D();
+        for (let i = 0; i < PETAL_COUNT; i++) {
+          const r = Math.pow(rng(), 0.5) * 0.45;
+          const a = rng() * Math.PI * 2;
+          dummy.position.set(Math.cos(a) * r, rng() * 0.4, Math.sin(a) * r);
+          dummy.updateMatrix();
+          petalMesh.setMatrixAt(i, dummy.matrix);
+        }
+        petalMesh.instanceMatrix.needsUpdate = true;
+      }
+      diorama.add(petalMesh);
 
       // Now that the diorama exists, drop the atmospheric layers in.
       diorama.add(shaftMesh);
@@ -811,7 +940,7 @@
       const sceneAxes = [
         { axis: 'x', input: 'scene-x', val: 'scene-x-val', initial: 0 },
         { axis: 'y', input: 'scene-y', val: 'scene-y-val', initial: 0 },
-        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.25 },
+        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.10 },
       ];
       for (const cfg of sceneAxes) {
         diorama.position[cfg.axis] = cfg.initial;
@@ -879,6 +1008,7 @@
         const dt = clock.getDelta();
         shaftMat.uniforms.uTime.value += dt;
         dustMat.uniforms.uTime.value += dt;
+        petalMat.uniforms.uTime.value += dt;
 
         composer.render();
 
