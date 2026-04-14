@@ -124,6 +124,11 @@
         <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.25">
         <code id="scene-z-val">-0.25</code>
       </div>
+      <div class="slider-row">
+        <span>Scene scale</span>
+        <input id="scene-s" type="range" min="0.1" max="5" step="0.05" value="1">
+        <code id="scene-s-val">1.00</code>
+      </div>
     </div>
 
     <div id="preview">
@@ -131,7 +136,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 real-world calibration</div>
+    <div id="build-stamp">Build 2026-04-14 scene scale slider</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -818,6 +823,14 @@
           valEl.textContent = v.toFixed(2);
         });
       }
+
+      const sceneSInput = document.getElementById('scene-s');
+      const sceneSVal = document.getElementById('scene-s-val');
+      sceneSInput.addEventListener('input', () => {
+        const v = parseFloat(sceneSInput.value);
+        diorama.scale.setScalar(v);
+        sceneSVal.textContent = v.toFixed(2);
+      });
 
       // -------------------- Post-processing --------------------
       // EffectComposer pipeline so future effects (DOF, SSR, vignette) can
