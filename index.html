@@ -121,7 +121,7 @@
       </div>
       <div class="slider-row">
         <span>Scene Z</span>
-        <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.08">
+        <input id="scene-z" type="range" min="-1.0" max="1.0" step="0.01" value="-0.08">
         <code id="scene-z-val">-0.08</code>
       </div>
       <div class="slider-row">
@@ -134,6 +134,11 @@
         <input id="box-d" type="range" min="5" max="40" step="0.5" value="15">
         <code id="box-d-val">15</code>
       </div>
+      <div class="slider-row">
+        <span>Box Z</span>
+        <input id="box-z" type="range" min="-1.0" max="1.0" step="0.01" value="0">
+        <code id="box-z-val">0.00</code>
+      </div>
     </div>
 
     <div id="preview">
@@ -141,7 +146,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 box fix (TDZ)</div>
+    <div id="build-stamp">Build 2026-04-14 box-z slider</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -399,6 +404,7 @@
         side: THREE.BackSide
       });
       let boxDepth = 0.152;       // 6 inches
+      let boxOffsetZ = 0;         // 0 means front face sits on the screen plane
       let windowBox = null;
       function rebuildWindowBox() {
         if (windowBox) {
@@ -409,7 +415,7 @@
         const h = screen.heightMeters;
         const g = new THREE.BoxGeometry(w, h, boxDepth);
         windowBox = new THREE.Mesh(g, boxMat);
-        windowBox.position.set(0, 0, -boxDepth / 2);
+        windowBox.position.set(0, 0, -boxDepth / 2 + boxOffsetZ);
         windowBox.receiveShadow = true;
         scene.add(windowBox);
       }
@@ -930,6 +936,15 @@
         boxDepth = parseFloat(boxDInput.value) / 100;
         boxDVal.textContent = boxDInput.value;
         rebuildWindowBox();
+      });
+
+      const boxZInput = document.getElementById('box-z');
+      const boxZVal = document.getElementById('box-z-val');
+      boxZInput.addEventListener('input', () => {
+        boxOffsetZ = parseFloat(boxZInput.value);
+        boxZVal.textContent = boxOffsetZ.toFixed(2);
+        // No geometry change — just slide the existing mesh.
+        if (windowBox) windowBox.position.z = -boxDepth / 2 + boxOffsetZ;
       });
 
       const sitBackInput = document.getElementById('sit-back');
