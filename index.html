@@ -97,7 +97,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 20:11 UTC</div>
+    <div id="build-stamp">Build 2026-04-14 20:14 UTC</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -286,7 +286,47 @@
       // webcam calibration varies wildly. A slider lets the user tune.
       let userScale = 1.0;
 
+      function withTimeout(promise, ms, label) {
+        return Promise.race([
+          promise,
+          new Promise((_, rej) => setTimeout(
+            () => rej(new Error(`${label} timed out after ${ms} ms`)), ms
+          ))
+        ]);
+      }
+
       async function startTracking() {
+        // visionOS Safari doesn't expose getUserMedia for the headset's
+        // cameras. Bail early with a useful message rather than hanging.
+        if (/visionOS|AppleWebKit.*XR/i.test(navigator.userAgent)) {
+          throw new Error('Vision Pro Safari does not expose webcam access. Open this page on a laptop or desktop with a camera.');
+        }
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('getUserMedia not supported in this browser.');
+        }
+
+        // Request the camera FIRST so permission failures surface before
+        // we pay the cost of downloading the MediaPipe model.
+        faceStatusEl.textContent = 'accept camera prompt ↑';
+        console.info('[fishtank] requesting getUserMedia — click allow in Safari\'s address bar prompt');
+        const stream = await withTimeout(
+          navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+            audio: false
+          }),
+          60000,
+          'Camera permission (check Safari\'s camera icon in the address bar, and macOS System Settings → Privacy & Security → Camera → Safari)'
+        );
+        console.info('[fishtank] camera stream acquired');
+
+        video.srcObject = stream;
+        await withTimeout(
+          new Promise((res) => { video.onloadedmetadata = res; }),
+          5000,
+          'Video metadata'
+        );
+        await video.play();
+
         faceStatusEl.textContent = 'loading model…';
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/wasm'
@@ -299,17 +339,10 @@
           runningMode: 'VIDEO',
           numFaces: 1,
           outputFaceBlendshapes: false,
-          outputFacialTransformationMatrixes: true
+          outputFacialTransformationMatrixes: false
         });
+        console.info('[fishtank] face landmarker ready');
 
-        faceStatusEl.textContent = 'requesting camera…';
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: false
-        });
-        video.srcObject = stream;
-        await new Promise((res) => video.onloadedmetadata = res);
-        video.play();
         tracking = true;
         faceStatusEl.textContent = 'tracking';
         document.getElementById('calibrate-btn').hidden = false;
@@ -383,8 +416,14 @@
       document.getElementById('start-btn').addEventListener('click', (ev) => {
         ev.currentTarget.disabled = true;
         startTracking().catch(err => {
-          console.error(err);
-          faceStatusEl.textContent = 'error: ' + err.message;
+          console.error('[fishtank]', err);
+          // Shorten for the HUD, keep full message in console.
+          const msg = err.name === 'NotAllowedError' ? 'camera permission denied'
+                    : err.name === 'NotFoundError' ? 'no camera found'
+                    : err.name === 'NotReadableError' ? 'camera in use by another app'
+                    : err.message.length > 60 ? err.message.slice(0, 58) + '…'
+                    : err.message;
+          faceStatusEl.textContent = 'error: ' + msg;
           ev.currentTarget.disabled = false;
         });
       });
