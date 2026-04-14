@@ -121,13 +121,18 @@
       </div>
       <div class="slider-row">
         <span>Scene Z</span>
-        <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.10">
-        <code id="scene-z-val">-0.10</code>
+        <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.08">
+        <code id="scene-z-val">-0.08</code>
       </div>
       <div class="slider-row">
         <span>Scene scale</span>
-        <input id="scene-s" type="range" min="0.1" max="5" step="0.05" value="1">
-        <code id="scene-s-val">1.00</code>
+        <input id="scene-s" type="range" min="0.1" max="5" step="0.05" value="0.35">
+        <code id="scene-s-val">0.35</code>
+      </div>
+      <div class="slider-row">
+        <span>Box depth (cm)</span>
+        <input id="box-d" type="range" min="5" max="40" step="0.5" value="15">
+        <code id="box-d-val">15</code>
       </div>
     </div>
 
@@ -136,7 +141,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 props + petals + 4" depth</div>
+    <div id="build-stamp">Build 2026-04-14 box diorama 6" deep</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -362,12 +367,37 @@
 
       // The diorama is parented to a single group so we can shove the
       // whole thing behind the screen plane in one go. Anything inside
-      // diorama.position.z = -0.25 sits ~25 cm "into" the window — that's
-      // what makes head movement actually look like parallax instead of a
-      // sticker rotating on the screen.
+      // sits ~8 cm "into" the window by default (≈ middle of the box).
       const diorama = new THREE.Group();
-      diorama.position.set(0, 0, -0.25);
+      diorama.position.set(0, 0, -0.08);
+      diorama.scale.setScalar(0.35);
       scene.add(diorama);
+
+      // -------------------- Window box (shoebox diorama) --------------------
+      // An inverted BoxGeometry — the camera sits in front of the open
+      // face and looks IN at the back-facing interior walls. Rebuilt
+      // whenever the canvas aspect or screen-width slider changes so
+      // the box always perfectly frames the visible viewport.
+      const boxMat = new THREE.MeshStandardMaterial({
+        color: 0x6e5a3f, roughness: 0.92, metalness: 0.0,
+        side: THREE.BackSide
+      });
+      let boxDepth = 0.152;       // 6 inches
+      let windowBox = null;
+      function rebuildWindowBox() {
+        if (windowBox) {
+          scene.remove(windowBox);
+          windowBox.geometry.dispose();
+        }
+        const w = screen.widthMeters;
+        const h = screen.heightMeters;
+        const g = new THREE.BoxGeometry(w, h, boxDepth);
+        windowBox = new THREE.Mesh(g, boxMat);
+        windowBox.position.set(0, 0, -boxDepth / 2);
+        windowBox.receiveShadow = true;
+        scene.add(windowBox);
+      }
+      rebuildWindowBox();
 
       // Ground / pedestal — the "floor of the fishtank"
       const pedestal = new THREE.Mesh(
@@ -379,14 +409,8 @@
       pedestal.castShadow = true;
       diorama.add(pedestal);
 
-      const floor = new THREE.Mesh(
-        new THREE.CircleGeometry(0.8, 64),
-        new THREE.MeshStandardMaterial({ color: 0x6e7a86, roughness: 0.9 })
-      );
-      floor.rotation.x = -Math.PI / 2;
-      floor.position.y = -0.2;
-      floor.receiveShadow = true;
-      diorama.add(floor);
+      // (The huge circle floor was removed — the box bottom is now the
+      // floor of the world.)
 
       // Bonsai placeholder — swapped out when ./bonsai.usdz loads.
       const bonsaiGroup = new THREE.Group();
@@ -897,6 +921,15 @@
       screenWInput.addEventListener('input', () => {
         screen.widthMeters = parseFloat(screenWInput.value) / 100;
         screenWVal.textContent = screenWInput.value;
+        rebuildWindowBox();
+      });
+
+      const boxDInput = document.getElementById('box-d');
+      const boxDVal = document.getElementById('box-d-val');
+      boxDInput.addEventListener('input', () => {
+        boxDepth = parseFloat(boxDInput.value) / 100;
+        boxDVal.textContent = boxDInput.value;
+        rebuildWindowBox();
       });
 
       const sitBackInput = document.getElementById('sit-back');
@@ -940,7 +973,7 @@
       const sceneAxes = [
         { axis: 'x', input: 'scene-x', val: 'scene-x-val', initial: 0 },
         { axis: 'y', input: 'scene-y', val: 'scene-y-val', initial: 0 },
-        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.10 },
+        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.08 },
       ];
       for (const cfg of sceneAxes) {
         diorama.position[cfg.axis] = cfg.initial;
@@ -984,6 +1017,7 @@
         composer.setSize(w, h);
         canvas.width = w * renderer.getPixelRatio();
         canvas.height = h * renderer.getPixelRatio();
+        rebuildWindowBox(); // screen.heightMeters depends on aspect
       }
       window.addEventListener('resize', resize);
       resize();
