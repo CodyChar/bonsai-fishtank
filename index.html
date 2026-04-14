@@ -97,11 +97,11 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 19:30 UTC</div>
+    <div id="build-stamp">Build 2026-04-14 20:11 UTC</div>
 
     <script type="module">
       import * as THREE from 'three';
-      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { USDZLoader } from 'three/addons/loaders/USDZLoader.js';
       import { FilesetResolver, FaceLandmarker } from
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/vision_bundle.mjs';
 
@@ -195,26 +195,30 @@
         parent.add(canopy3);
       }
 
-      // Try to upgrade to ./bonsai.glb if present.
-      new GLTFLoader().load(
-        './bonsai.glb',
-        (gltf) => {
+      // Load the bonsai USDZ (reused from the other experiments repo).
+      // three.js's USDZLoader handles the Meshy-authored UsdPreviewSurface
+      // path; complex MaterialX graphs would need GLB instead.
+      new USDZLoader().load(
+        './bonsai.usdz',
+        (usdz) => {
           bonsaiGroup.clear();
-          bonsaiGroup.add(gltf.scene);
-          // Normalize to a bounding radius of ~0.2m so the tree fits the tank.
-          const box = new THREE.Box3().setFromObject(gltf.scene);
+          bonsaiGroup.add(usdz);
+          // Normalize to a ~0.3 m bounding box so the tree fits the tank
+          // regardless of how the asset was originally scaled.
+          const box = new THREE.Box3().setFromObject(usdz);
           const size = box.getSize(new THREE.Vector3());
           const longest = Math.max(size.x, size.y, size.z);
           const scale = 0.3 / longest;
-          gltf.scene.scale.setScalar(scale);
-          const centered = new THREE.Box3().setFromObject(gltf.scene);
-          const c = centered.getCenter(new THREE.Vector3());
-          gltf.scene.position.sub(c);
-          gltf.scene.position.y += (centered.max.y - centered.min.y) / 2 - 0.16;
-          gltf.scene.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+          usdz.scale.setScalar(scale);
+          const rebox = new THREE.Box3().setFromObject(usdz);
+          const c = rebox.getCenter(new THREE.Vector3());
+          usdz.position.sub(c);
+          // Sit the tree on top of the pedestal.
+          usdz.position.y += (rebox.max.y - rebox.min.y) / 2 * scale - 0.16;
+          usdz.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
         },
         undefined,
-        () => console.info('[bonsai] bonsai.glb not found — using primitive fallback')
+        (err) => console.warn('[bonsai] bonsai.usdz load failed — using primitive fallback', err)
       );
 
       // -------------------- Screen geometry --------------------
@@ -317,38 +321,57 @@
         lastVideoTime = video.currentTime;
 
         const result = faceLandmarker.detectForVideo(video, performance.now());
-        const matrices = result.facialTransformationMatrixes;
-        if (!matrices || !matrices.length) {
-          faceStatusEl.textContent = 'no face';
-          return;
-        }
+        const landmarks = result.faceLandmarks?.[0];
+        if (!landmarks) { faceStatusEl.textContent = 'no face'; return; }
         faceStatusEl.textContent = 'tracking';
 
-        // MediaPipe canonical metric face model is ~cm; convert to meters.
-        // Matrix is column-major; translation is elements 12..14 (x, y, z).
-        // MediaPipe camera space: +x right, +y down, +z forward from camera.
-        // Our world: +x right, +y up, +z forward from screen toward viewer.
-        const m = matrices[0].data;
-        const fx =  m[12] * 0.01 * userScale;
-        const fy = -m[13] * 0.01 * userScale;   // flip Y (MediaPipe down → world up)
-        const fz =  m[14] * 0.01 * userScale;   // depth from camera
+        // Iris centers are landmarks 468 (right) and 473 (left) when
+        // Face Landmarker is configured with iris refinement (default).
+        // Using them gives us the exact inter-pupillary midpoint, which
+        // is where a viewer's "eye" effectively is for a fishtank-VR
+        // illusion, and lets us derive depth geometrically from the
+        // known inter-pupillary distance — no brittle matrix unit
+        // conventions.
+        const rIris = landmarks[468];
+        const lIris = landmarks[473];
+        if (!rIris || !lIris) { faceStatusEl.textContent = 'no iris'; return; }
 
-        // Webcam is assumed to sit right above the screen, at (0, H/2, 0).
-        // Eye position = webcam position + face offset (+z pushes eye away
-        // from screen into the room).
-        const wx = fx;
-        const wy = screen.heightMeters / 2 + fy;
-        const wz = fz;
+        const mx = (rIris.x + lIris.x) / 2;
+        const my = (rIris.y + lIris.y) / 2;
+
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const dxPx = (rIris.x - lIris.x) * vw;
+        const dyPx = (rIris.y - lIris.y) * vh;
+        const irisPixelDist = Math.hypot(dxPx, dyPx);
+        if (irisPixelDist < 4) return;
+
+        // Pinhole model: from known real inter-pupillary distance and
+        // observed pixel distance, recover metric depth.
+        const realIPD = 0.063;              // meters, average adult IPD
+        const assumedFovDeg = 60;           // typical laptop webcam HFOV
+        const f_px = vw / (2 * Math.tan((assumedFovDeg / 2) * Math.PI / 180));
+        const depth = realIPD * f_px / irisPixelDist;   // meters
+
+        // Iris midpoint → camera-space coords. Webcam captures a non-
+        // mirrored image, so moving your head right shows you moving
+        // left in the frame. We negate X to put the eye on the correct
+        // side of the world.
+        const camX = -((mx - 0.5) * vw) / f_px * depth;
+        const camY = -((my - 0.5) * vh) / f_px * depth;   // image Y-down → world Y-up
+        const camZ = depth;
+
+        // Webcam is assumed to sit directly above the screen at
+        // (0, screen.heightMeters/2, 0) in world space.
+        const wx = camX * userScale;
+        const wy = screen.heightMeters / 2 + camY * userScale;
+        const wz = camZ * userScale;
 
         eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
-        // Preview dot on webcam feed
-        const landmarks = result.faceLandmarks?.[0];
-        if (landmarks) {
-          const nose = landmarks[1]; // tip of nose
-          faceDot.style.transform = `translate(${(1 - nose.x) * 180}px, ${nose.y * 135}px)`;
-          faceDot.style.display = 'block';
-        }
+        // Preview dot on the (mirrored) webcam preview.
+        // Preview is 180x135; dot is 8x8 so subtract 4 to center.
+        faceDot.style.transform = `translate(${(1 - mx) * 180 - 4}px, ${my * 135 - 4}px)`;
+        faceDot.style.display = 'block';
       }
 
       document.getElementById('calibrate-btn').addEventListener('click', () => {

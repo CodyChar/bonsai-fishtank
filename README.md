@@ -30,11 +30,14 @@ different 2D image depending on where your eye is.
 
 ## Replacing the bonsai
 
-Drop a `bonsai.glb` at the repo root and reload — it'll replace the
-primitive-cylinder placeholder. Asset is auto-normalized to a 0.3 m bounding
-box and placed on the pedestal.
+The repo ships with `bonsai.usdz` (the same Meshy-authored asset reused
+from the AVP_AI_Experiments project). It's loaded via three.js's
+`USDZLoader`, which supports `UsdPreviewSurface` materials. The asset is
+auto-normalized to a 0.3 m bounding box and placed on the pedestal.
 
-Meshy (text-to-3D) exports GLB directly. Any GLB works.
+If the USDZ fails to load (complex MaterialX, unsupported features), the
+page falls back to a primitive-cylinder bonsai. To swap in a different
+model, replace `bonsai.usdz` at the repo root.
 
 ## Stack
 
