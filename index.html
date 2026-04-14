@@ -111,7 +111,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 meshy tree + cam sliders</div>
+    <div id="build-stamp">Build 2026-04-14 meshy fix + dimmed</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -130,7 +130,7 @@
       renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.35;
+      renderer.toneMappingExposure = 0.95;
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
@@ -156,7 +156,7 @@
         mesh.frustumCulled = false;
         return mesh;
       }
-      const sky = makeSky(0xb9d4ea, 0xe8c79a); // soft dawn / overcast haze
+      const sky = makeSky(0x6a89a8, 0x8a7458); // muted dawn / dusk haze
       scene.add(sky);
 
       // Image-based lighting from a generated room environment so PBR
@@ -173,9 +173,9 @@
       // the viewer's eye position relative to the screen rectangle.
       const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 10);
 
-      // Lighting — bright key + warm fill + cool rim, balanced for ACES.
-      scene.add(new THREE.HemisphereLight(0xfff2d0, 0x59513f, 1.1));
-      const sun = new THREE.DirectionalLight(0xffd7a0, 4.5);
+      // Lighting — moody key + soft fill + warm rim, balanced for ACES.
+      scene.add(new THREE.HemisphereLight(0xd8c8a8, 0x3a352a, 0.55));
+      const sun = new THREE.DirectionalLight(0xffd7a0, 2.4);
       sun.position.set(-0.6, 1.2, 0.8);
       sun.castShadow = true;
       sun.shadow.mapSize.set(2048, 2048);
@@ -186,11 +186,11 @@
       sun.shadow.normalBias = 0.02;
       scene.add(sun);
 
-      const fill = new THREE.DirectionalLight(0xb8d4ff, 1.2);
+      const fill = new THREE.DirectionalLight(0x8aa6cc, 0.6);
       fill.position.set(0.8, 0.6, 0.4);
       scene.add(fill);
 
-      const rim = new THREE.DirectionalLight(0xffe0b3, 1.6);
+      const rim = new THREE.DirectionalLight(0xffd7a0, 0.8);
       rim.position.set(0.2, 0.8, -1.0);
       scene.add(rim);
 
@@ -418,20 +418,48 @@
       new USDZLoader().load(
         './bonsai-meshy.usdz',
         (usdz) => {
-          bonsaiGroup.clear();
-          bonsaiGroup.add(usdz);
-          // Normalize to a ~0.3 m bounding box, then centre at the
-          // diorama origin so the height + pitch sliders pivot around
-          // the middle of the tree (not its base).
+          // Compute bbox BEFORE adding to the scene so the parent
+          // group's transform doesn't pollute the measurement.
           const box = new THREE.Box3().setFromObject(usdz);
           const size = box.getSize(new THREE.Vector3());
           const longest = Math.max(size.x, size.y, size.z);
+          if (!isFinite(longest) || longest <= 0) {
+            console.warn('[bonsai] usdz has empty bbox — keeping primitive fallback', size);
+            return;
+          }
           const scale = 0.3 / longest;
           usdz.scale.setScalar(scale);
+          // Recentre using the *scaled* box so the pivot lands on the
+          // tree, not in empty space.
           const rebox = new THREE.Box3().setFromObject(usdz);
           const c = rebox.getCenter(new THREE.Vector3());
           usdz.position.sub(c);
-          usdz.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+
+          // Defensive material fixes: Meshy assets sometimes ship with
+          // single-sided geometry, transparent flags on opaque materials,
+          // or alphaTest values that wipe out the canopy. Normalise so
+          // the tree is guaranteed visible.
+          usdz.traverse(o => {
+            if (!o.isMesh) return;
+            o.castShadow = true;
+            o.receiveShadow = true;
+            o.frustumCulled = false; // bbox occasionally lies on USDZ
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            for (const m of mats) {
+              if (!m) continue;
+              m.side = THREE.DoubleSide;
+              if (m.transparent && (m.opacity === undefined || m.opacity > 0.99)) {
+                m.transparent = false;
+                m.depthWrite = true;
+              }
+              if (m.alphaTest > 0.5) m.alphaTest = 0.1;
+              m.needsUpdate = true;
+            }
+          });
+          console.info('[bonsai] usdz loaded, bbox', size, 'scale', scale);
+
+          bonsaiGroup.clear();
+          bonsaiGroup.add(usdz);
         },
         undefined,
         (err) => console.warn('[bonsai] usdz load failed — using primitive fallback', err)
@@ -744,9 +772,9 @@
       composer.addPass(new RenderPass(scene, camera));
       const bloomPass = new UnrealBloomPass(
         new THREE.Vector2(window.innerWidth, window.innerHeight),
-        0.7,   // strength
-        0.75,  // radius
-        0.85   // threshold — only the brightest pixels (sun, glints) bloom
+        0.45,  // strength
+        0.7,   // radius
+        0.9    // threshold — only the brightest pixels (sun, glints) bloom
       );
       composer.addPass(bloomPass);
       composer.addPass(new OutputPass());
