@@ -94,6 +94,16 @@
         <input id="screen-w" type="range" min="15" max="80" step="1" value="34">
         <code id="screen-w-val">34</code>
       </div>
+      <div class="slider-row">
+        <span>Cam height</span>
+        <input id="cam-h" type="range" min="-0.3" max="0.3" step="0.01" value="0">
+        <code id="cam-h-val">0.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Cam pitch</span>
+        <input id="cam-p" type="range" min="-45" max="45" step="1" value="0">
+        <code id="cam-p-val">0°</code>
+      </div>
     </div>
 
     <div id="preview">
@@ -101,7 +111,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 lit + bloom + parallax</div>
+    <div id="build-stamp">Build 2026-04-14 meshy tree + cam sliders</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -402,16 +412,17 @@
         parent.add(canopy3);
       }
 
-      // Load the bonsai USDZ (reused from the other experiments repo).
-      // three.js's USDZLoader handles the Meshy-authored UsdPreviewSurface
-      // path; complex MaterialX graphs would need GLB instead.
+      // Load the bonsai USDZ. three.js's USDZLoader handles the Meshy-
+      // authored UsdPreviewSurface path; complex MaterialX graphs would
+      // need GLB instead.
       new USDZLoader().load(
-        './bonsai.usdz',
+        './bonsai-meshy.usdz',
         (usdz) => {
           bonsaiGroup.clear();
           bonsaiGroup.add(usdz);
-          // Normalize to a ~0.3 m bounding box so the tree fits the tank
-          // regardless of how the asset was originally scaled.
+          // Normalize to a ~0.3 m bounding box, then centre at the
+          // diorama origin so the height + pitch sliders pivot around
+          // the middle of the tree (not its base).
           const box = new THREE.Box3().setFromObject(usdz);
           const size = box.getSize(new THREE.Vector3());
           const longest = Math.max(size.x, size.y, size.z);
@@ -420,12 +431,10 @@
           const rebox = new THREE.Box3().setFromObject(usdz);
           const c = rebox.getCenter(new THREE.Vector3());
           usdz.position.sub(c);
-          // Sit the tree on top of the pedestal.
-          usdz.position.y += (rebox.max.y - rebox.min.y) / 2 * scale - 0.16;
           usdz.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
         },
         undefined,
-        (err) => console.warn('[bonsai] bonsai.usdz load failed — using primitive fallback', err)
+        (err) => console.warn('[bonsai] usdz load failed — using primitive fallback', err)
       );
 
       // -------------------- Screen geometry --------------------
@@ -699,6 +708,33 @@
         screenWVal.textContent = screenWInput.value;
       });
 
+      // Cam height = vertical offset added to the viewer eye. Positive
+      // means the user is looking down at the bonsai from above; negative
+      // means looking up at it from below. Off-axis projection stays
+      // valid because the screen rect is unchanged — we just relocate
+      // where the viewer is in front of it.
+      let camHeight = 0;
+      const camHInput = document.getElementById('cam-h');
+      const camHVal = document.getElementById('cam-h-val');
+      camHInput.addEventListener('input', () => {
+        camHeight = parseFloat(camHInput.value);
+        camHVal.textContent = camHeight.toFixed(2);
+      });
+
+      // Cam pitch = rotation of the *diorama* around X. Tilting the
+      // world is more well-defined than tilting the off-axis camera (the
+      // camera always has to face the screen plane for the projection to
+      // make sense), and visually it does the same job — you see the top
+      // of the canopy at positive pitch, the underside at negative.
+      let camPitchDeg = 0;
+      const camPInput = document.getElementById('cam-p');
+      const camPVal = document.getElementById('cam-p-val');
+      camPInput.addEventListener('input', () => {
+        camPitchDeg = parseFloat(camPInput.value);
+        camPVal.textContent = `${camPitchDeg | 0}°`;
+        diorama.rotation.x = THREE.MathUtils.degToRad(camPitchDeg);
+      });
+
       // -------------------- Post-processing --------------------
       // EffectComposer pipeline so future effects (DOF, SSR, vignette) can
       // slot in as additional passes without touching the main loop.
@@ -731,12 +767,17 @@
       let frames = 0, fpsT0 = performance.now();
       const clock = new THREE.Clock();
 
+      const _eyeWithOffsets = new THREE.Vector3();
       function animate() {
         tickFace();
         // Low-pass filter the eye so micro-jitter in face tracking doesn't
         // turn into visible judder on the tree.
         eyeSmoothed.lerp(eye, 0.35);
-        updateOffAxisCamera(eyeSmoothed);
+        // Apply the manual height offset on top of the tracked eye —
+        // sliders are framing controls, tracking is parallax.
+        _eyeWithOffsets.copy(eyeSmoothed);
+        _eyeWithOffsets.y += camHeight;
+        updateOffAxisCamera(_eyeWithOffsets);
 
         const dt = clock.getDelta();
         shaftMat.uniforms.uTime.value += dt;
