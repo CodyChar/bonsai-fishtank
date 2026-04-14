@@ -91,8 +91,13 @@
       </div>
       <div class="slider-row">
         <span>Screen W (cm)</span>
-        <input id="screen-w" type="range" min="15" max="80" step="1" value="34">
-        <code id="screen-w-val">34</code>
+        <input id="screen-w" type="range" min="15" max="80" step="0.5" value="35.5">
+        <code id="screen-w-val">35.5</code>
+      </div>
+      <div class="slider-row">
+        <span>Sit-back (cm)</span>
+        <input id="sit-back" type="range" min="20" max="120" step="1" value="61">
+        <code id="sit-back-val">61</code>
       </div>
       <div class="slider-row">
         <span>Cam height</span>
@@ -126,7 +131,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 scene xyz sliders</div>
+    <div id="build-stamp">Build 2026-04-14 real-world calibration</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -485,7 +490,7 @@
       // Screen width is a real physical size the user enters so the parallax
       // feels correct. Height is derived from the canvas aspect ratio.
       const screen = {
-        widthMeters: 0.34,
+        widthMeters: 0.355,    // 14" — the user's actual browser window width
         get heightMeters() {
           const aspect = window.innerHeight / window.innerWidth;
           return this.widthMeters * aspect;
@@ -535,7 +540,10 @@
       let faceLandmarker = null;
       let tracking = false;
       let lastVideoTime = -1;
-      const eye = new THREE.Vector3(0, 0, 0.5); // default eye, straight ahead
+      // Default eye sits 24" out, level with the canvas centre. The
+      // tracker overwrites this every frame once enabled.
+      const eye = new THREE.Vector3(0, 0, 0.61);
+      let targetDepth = 0.61;          // calibration anchor in metres
       let eyeSmoothed = eye.clone();
       let calibrationOffset = new THREE.Vector3();
 
@@ -687,14 +695,21 @@
         // mirrored image, so moving your head right shows you moving
         // left in the frame. We negate X to put the eye on the correct
         // side of the world.
-        const camX = -((mx - 0.5) * vw) / f_px * depth;
-        const camY = -((my - 0.5) * vh) / f_px * depth;   // image Y-down → world Y-up
+        //
+        // Note: the f_px terms cancel out because depth itself scales
+        // with f_px in exactly the inverse way, so camX and camY drop
+        // out to a clean (mx-0.5) * vw * realIPD / irisPixelDist —
+        // physically correct in METRES regardless of the assumed HFOV.
+        // Only camZ depends on the HFOV guess, so userScale corrects
+        // depth alone, not lateral.
+        const camX = -((mx - 0.5) * vw) * realIPD / irisPixelDist;
+        const camY = -((my - 0.5) * vh) * realIPD / irisPixelDist;
         const camZ = depth;
 
         // Webcam is assumed to sit directly above the screen at
         // (0, screen.heightMeters/2, 0) in world space.
-        const wx = camX * userScale;
-        const wy = screen.heightMeters / 2 + camY * userScale;
+        const wx = camX;
+        const wy = screen.heightMeters / 2 + camY;
         const wz = camZ * userScale;
 
         eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
@@ -706,19 +721,18 @@
       }
 
       document.getElementById('calibrate-btn').addEventListener('click', () => {
-        // Recover the raw (pre-scale, pre-offset) measurements from the
-        // current eye, then re-anchor: depth → 0.5 m via userScale, and
-        // lateral / vertical → 0 via the offsets. After this, the user's
-        // current head pose IS the "natural sit-back" pose, regardless of
-        // what their webcam HFOV actually is.
-        const TARGET_DEPTH = 0.5;
-        const camX = (eye.x + calibrationOffset.x) / userScale;
-        const camY = (eye.y - screen.heightMeters / 2 + calibrationOffset.y) / userScale;
+        // Anchor "right now" as the natural pose: depth → targetDepth
+        // (set by the Sit-back slider) via userScale on Z, and lateral
+        // / vertical → 0 via the offsets. Lateral and vertical are
+        // already in real metres so the offsets are just the current
+        // raw values — no scale gymnastics.
+        const camX = eye.x + calibrationOffset.x;
+        const camY = eye.y - screen.heightMeters / 2 + calibrationOffset.y;
         const camZ = Math.max(0.05, (eye.z + calibrationOffset.z) / userScale);
-        userScale = THREE.MathUtils.clamp(TARGET_DEPTH / camZ, 0.2, 4);
+        userScale = THREE.MathUtils.clamp(targetDepth / camZ, 0.2, 4);
         scaleInput.value = userScale.toFixed(2);
         scaleVal.textContent = userScale.toFixed(2);
-        calibrationOffset.set(camX * userScale, camY * userScale, 0);
+        calibrationOffset.set(camX, camY, 0);
       });
 
       document.getElementById('start-btn').addEventListener('click', (ev) => {
@@ -749,6 +763,13 @@
       screenWInput.addEventListener('input', () => {
         screen.widthMeters = parseFloat(screenWInput.value) / 100;
         screenWVal.textContent = screenWInput.value;
+      });
+
+      const sitBackInput = document.getElementById('sit-back');
+      const sitBackVal = document.getElementById('sit-back-val');
+      sitBackInput.addEventListener('input', () => {
+        targetDepth = parseFloat(sitBackInput.value) / 100;
+        sitBackVal.textContent = sitBackInput.value;
       });
 
       // Cam height = vertical offset added to the viewer eye. Positive
