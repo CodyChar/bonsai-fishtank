@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bonsai Fishtank</title>
+
+    <!-- Head-coupled perspective illusion ("fishtank VR") driven by the
+         front-facing webcam. MediaPipe Face Landmarker tracks the user's
+         face in real time; we extract the 3D translation of the face
+         relative to the webcam, map it into world space as the viewer's
+         eye, then rebuild an off-axis (asymmetric) projection matrix
+         each frame so the screen behaves as a window onto the scene
+         instead of a fixed camera view. -->
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <style>
+      :root { color-scheme: light dark; font-family: -apple-system, system-ui, sans-serif; }
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0b0f14; color: #e8eef5; }
+
+      #canvas { width: 100vw; height: 100vh; display: block; }
+      #hud {
+        position: fixed; top: 12px; left: 12px; z-index: 10;
+        padding: 10px 14px;
+        background: rgba(10, 14, 22, 0.72);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        border-radius: 12px;
+        font-size: 13px; line-height: 1.5;
+        min-width: 220px;
+      }
+      #hud h1 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+      #hud .row { display: flex; justify-content: space-between; gap: 12px; }
+      #hud code { color: #8cb3d9; }
+      .btn {
+        appearance: none; border: 0; border-radius: 8px;
+        padding: 10px 14px; margin: 6px 4px 0 0;
+        background: #2a6df4; color: #fff; font-size: 13px; font-weight: 500;
+        cursor: pointer;
+      }
+      .btn:hover { filter: brightness(1.1); }
+      .btn.secondary { background: #3a4352; }
+
+      #preview {
+        position: fixed; bottom: 12px; right: 12px; z-index: 10;
+        width: 180px; height: 135px;
+        border-radius: 8px; overflow: hidden;
+        background: #000;
+        border: 1px solid rgba(255,255,255,0.1);
+      }
+      #preview video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+      #preview .dot { position: absolute; top: 0; left: 0; width: 8px; height: 8px; border-radius: 50%; background: #7bff8c; box-shadow: 0 0 0 2px #000; pointer-events: none; }
+
+      #build-stamp {
+        position: fixed; bottom: 8px; left: 12px; z-index: 10;
+        font-size: 10px; opacity: 0.5; font-family: ui-monospace, Menlo, monospace;
+      }
+
+      .slider-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-top: 6px; }
+      .slider-row input { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+
+    <div id="hud">
+      <h1>Bonsai Fishtank</h1>
+      <div class="row"><span>FPS</span><code id="fps">—</code></div>
+      <div class="row"><span>Face</span><code id="face-status">waiting for camera</code></div>
+      <div class="row"><span>Eye (m)</span><code id="eye-pos">—</code></div>
+      <div>
+        <button id="start-btn" class="btn">Enable Camera</button>
+        <button id="calibrate-btn" class="btn secondary" hidden>Recenter</button>
+      </div>
+      <div class="slider-row">
+        <span>Scale</span>
+        <input id="scale" type="range" min="0.2" max="4" step="0.05" value="1">
+        <code id="scale-val">1.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Screen W (cm)</span>
+        <input id="screen-w" type="range" min="15" max="80" step="1" value="34">
+        <code id="screen-w-val">34</code>
+      </div>
+    </div>
+
+    <div id="preview">
+      <video id="video" autoplay playsinline muted></video>
+      <div class="dot" id="face-dot"></div>
+    </div>
+
+    <div id="build-stamp">Build 2026-04-14 19:30 UTC</div>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { FilesetResolver, FaceLandmarker } from
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/vision_bundle.mjs';
+
+      // -------------------- Scene --------------------
+      const canvas = document.getElementById('canvas');
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x12161d);
+
+      // Off-axis camera — projection matrix is rebuilt each frame based on
+      // the viewer's eye position relative to the screen rectangle.
+      const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 10);
+
+      // Lighting
+      scene.add(new THREE.HemisphereLight(0xfff2d0, 0x2a2118, 0.55));
+      const sun = new THREE.DirectionalLight(0xffd7a0, 2.2);
+      sun.position.set(-0.6, 1.2, 0.8);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(1024, 1024);
+      sun.shadow.camera.left = -0.5; sun.shadow.camera.right = 0.5;
+      sun.shadow.camera.top = 0.5; sun.shadow.camera.bottom = -0.5;
+      sun.shadow.bias = -0.0005;
+      scene.add(sun);
+
+      // Ground / pedestal — the "floor of the fishtank"
+      const pedestal = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.18, 0.2, 0.04, 48),
+        new THREE.MeshStandardMaterial({ color: 0x2a1f16, roughness: 0.85 })
+      );
+      pedestal.position.y = -0.18;
+      pedestal.receiveShadow = true;
+      pedestal.castShadow = true;
+      scene.add(pedestal);
+
+      const floor = new THREE.Mesh(
+        new THREE.CircleGeometry(0.8, 64),
+        new THREE.MeshStandardMaterial({ color: 0x181c23, roughness: 0.95 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -0.2;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // Bonsai placeholder — swapped out if ./bonsai.glb exists
+      const bonsaiGroup = new THREE.Group();
+      scene.add(bonsaiGroup);
+      buildPrimitiveBonsai(bonsaiGroup);
+
+      function buildPrimitiveBonsai(parent) {
+        parent.clear();
+        const trunk = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.015, 0.025, 0.28, 12),
+          new THREE.MeshStandardMaterial({ color: 0x5d4037, roughness: 0.85 })
+        );
+        trunk.position.y = -0.04;
+        trunk.castShadow = true; trunk.receiveShadow = true;
+        parent.add(trunk);
+        const branch = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.01, 0.015, 0.18, 10),
+          new THREE.MeshStandardMaterial({ color: 0x5d4037, roughness: 0.85 })
+        );
+        branch.position.set(0.055, 0.05, 0);
+        branch.rotation.z = -Math.PI / 4;
+        branch.castShadow = true; branch.receiveShadow = true;
+        parent.add(branch);
+        const canopy1 = new THREE.Mesh(
+          new THREE.SphereGeometry(0.12, 24, 16),
+          new THREE.MeshStandardMaterial({ color: 0x2e7d32, roughness: 0.8 })
+        );
+        canopy1.position.set(0, 0.16, 0); canopy1.scale.set(1, 0.6, 1);
+        canopy1.castShadow = true; canopy1.receiveShadow = true;
+        parent.add(canopy1);
+        const canopy2 = new THREE.Mesh(
+          new THREE.SphereGeometry(0.08, 24, 16),
+          new THREE.MeshStandardMaterial({ color: 0x388e3c, roughness: 0.8 })
+        );
+        canopy2.position.set(0.1, 0.1, 0); canopy2.scale.set(1, 0.55, 1);
+        canopy2.castShadow = true; canopy2.receiveShadow = true;
+        parent.add(canopy2);
+        const canopy3 = new THREE.Mesh(
+          new THREE.SphereGeometry(0.07, 24, 16),
+          new THREE.MeshStandardMaterial({ color: 0x2e7d32, roughness: 0.8 })
+        );
+        canopy3.position.set(-0.08, 0.08, -0.04); canopy3.scale.set(1, 0.55, 1);
+        canopy3.castShadow = true; canopy3.receiveShadow = true;
+        parent.add(canopy3);
+      }
+
+      // Try to upgrade to ./bonsai.glb if present.
+      new GLTFLoader().load(
+        './bonsai.glb',
+        (gltf) => {
+          bonsaiGroup.clear();
+          bonsaiGroup.add(gltf.scene);
+          // Normalize to a bounding radius of ~0.2m so the tree fits the tank.
+          const box = new THREE.Box3().setFromObject(gltf.scene);
+          const size = box.getSize(new THREE.Vector3());
+          const longest = Math.max(size.x, size.y, size.z);
+          const scale = 0.3 / longest;
+          gltf.scene.scale.setScalar(scale);
+          const centered = new THREE.Box3().setFromObject(gltf.scene);
+          const c = centered.getCenter(new THREE.Vector3());
+          gltf.scene.position.sub(c);
+          gltf.scene.position.y += (centered.max.y - centered.min.y) / 2 - 0.16;
+          gltf.scene.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+        },
+        undefined,
+        () => console.info('[bonsai] bonsai.glb not found — using primitive fallback')
+      );
+
+      // -------------------- Screen geometry --------------------
+      // Screen plane sits at world z=0. Tree is behind it at negative z.
+      // Screen width is a real physical size the user enters so the parallax
+      // feels correct. Height is derived from the canvas aspect ratio.
+      const screen = {
+        widthMeters: 0.34,
+        get heightMeters() {
+          const aspect = window.innerHeight / window.innerWidth;
+          return this.widthMeters * aspect;
+        },
+        // Corner positions in world space (z=0):
+        pa() { return new THREE.Vector3(-this.widthMeters / 2, -this.heightMeters / 2, 0); }, // lower-left
+        pb() { return new THREE.Vector3( this.widthMeters / 2, -this.heightMeters / 2, 0); }, // lower-right
+        pc() { return new THREE.Vector3(-this.widthMeters / 2,  this.heightMeters / 2, 0); }, // upper-left
+      };
+
+      // -------------------- Off-axis projection (Kooima 2009) --------------------
+      const _vr = new THREE.Vector3(), _vu = new THREE.Vector3(), _vn = new THREE.Vector3();
+      const _va = new THREE.Vector3(), _vb = new THREE.Vector3(), _vc = new THREE.Vector3();
+      function updateOffAxisCamera(eye) {
+        const pa = screen.pa(), pb = screen.pb(), pc = screen.pc();
+        _vr.copy(pb).sub(pa).normalize();
+        _vu.copy(pc).sub(pa).normalize();
+        _vn.crossVectors(_vr, _vu).normalize();
+
+        _va.copy(pa).sub(eye);
+        _vb.copy(pb).sub(eye);
+        _vc.copy(pc).sub(eye);
+
+        const d = -_va.dot(_vn);            // distance eye → screen plane
+        const near = Math.max(0.05, d * 0.1);
+        const far = 10;
+        const s = near / d;
+        const l = _vr.dot(_va) * s;
+        const r = _vr.dot(_vb) * s;
+        const b = _vu.dot(_va) * s;
+        const t = _vu.dot(_vc) * s;
+
+        camera.projectionMatrix.makePerspective(l, r, t, b, near, far);
+        camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+
+        camera.position.copy(eye);
+        camera.up.set(0, 1, 0);
+        camera.lookAt(0, 0, 0);
+      }
+
+      // -------------------- Face tracking --------------------
+      const video = document.getElementById('video');
+      const faceDot = document.getElementById('face-dot');
+      const eyePosEl = document.getElementById('eye-pos');
+      const faceStatusEl = document.getElementById('face-status');
+
+      let faceLandmarker = null;
+      let tracking = false;
+      let lastVideoTime = -1;
+      const eye = new THREE.Vector3(0, 0, 0.5); // default eye, straight ahead
+      let eyeSmoothed = eye.clone();
+      let calibrationOffset = new THREE.Vector3();
+
+      // How to map MediaPipe's face translation units into world meters.
+      // MediaPipe facial-transformation matrix translation is in cm for the
+      // canonical metric face model, so 0.01 is the theoretical scale — but
+      // webcam calibration varies wildly. A slider lets the user tune.
+      let userScale = 1.0;
+
+      async function startTracking() {
+        faceStatusEl.textContent = 'loading model…';
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/wasm'
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'GPU'
+          },
+          runningMode: 'VIDEO',
+          numFaces: 1,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: true
+        });
+
+        faceStatusEl.textContent = 'requesting camera…';
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        await new Promise((res) => video.onloadedmetadata = res);
+        video.play();
+        tracking = true;
+        faceStatusEl.textContent = 'tracking';
+        document.getElementById('calibrate-btn').hidden = false;
+      }
+
+      function tickFace() {
+        if (!tracking || !faceLandmarker || video.readyState < 2) return;
+        if (video.currentTime === lastVideoTime) return;
+        lastVideoTime = video.currentTime;
+
+        const result = faceLandmarker.detectForVideo(video, performance.now());
+        const matrices = result.facialTransformationMatrixes;
+        if (!matrices || !matrices.length) {
+          faceStatusEl.textContent = 'no face';
+          return;
+        }
+        faceStatusEl.textContent = 'tracking';
+
+        // MediaPipe canonical metric face model is ~cm; convert to meters.
+        // Matrix is column-major; translation is elements 12..14 (x, y, z).
+        // MediaPipe camera space: +x right, +y down, +z forward from camera.
+        // Our world: +x right, +y up, +z forward from screen toward viewer.
+        const m = matrices[0].data;
+        const fx =  m[12] * 0.01 * userScale;
+        const fy = -m[13] * 0.01 * userScale;   // flip Y (MediaPipe down → world up)
+        const fz =  m[14] * 0.01 * userScale;   // depth from camera
+
+        // Webcam is assumed to sit right above the screen, at (0, H/2, 0).
+        // Eye position = webcam position + face offset (+z pushes eye away
+        // from screen into the room).
+        const wx = fx;
+        const wy = screen.heightMeters / 2 + fy;
+        const wz = fz;
+
+        eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
+
+        // Preview dot on webcam feed
+        const landmarks = result.faceLandmarks?.[0];
+        if (landmarks) {
+          const nose = landmarks[1]; // tip of nose
+          faceDot.style.transform = `translate(${(1 - nose.x) * 180}px, ${nose.y * 135}px)`;
+          faceDot.style.display = 'block';
+        }
+      }
+
+      document.getElementById('calibrate-btn').addEventListener('click', () => {
+        // Zero out lateral + vertical drift; keep the measured depth.
+        calibrationOffset.x = eye.x;
+        calibrationOffset.y = eye.y - screen.heightMeters / 2;
+      });
+
+      document.getElementById('start-btn').addEventListener('click', (ev) => {
+        ev.currentTarget.disabled = true;
+        startTracking().catch(err => {
+          console.error(err);
+          faceStatusEl.textContent = 'error: ' + err.message;
+          ev.currentTarget.disabled = false;
+        });
+      });
+
+      // -------------------- UI wiring --------------------
+      const scaleInput = document.getElementById('scale');
+      const scaleVal = document.getElementById('scale-val');
+      scaleInput.addEventListener('input', () => {
+        userScale = parseFloat(scaleInput.value);
+        scaleVal.textContent = userScale.toFixed(2);
+      });
+
+      const screenWInput = document.getElementById('screen-w');
+      const screenWVal = document.getElementById('screen-w-val');
+      screenWInput.addEventListener('input', () => {
+        screen.widthMeters = parseFloat(screenWInput.value) / 100;
+        screenWVal.textContent = screenWInput.value;
+      });
+
+      // -------------------- Resize --------------------
+      function resize() {
+        const w = window.innerWidth, h = window.innerHeight;
+        renderer.setSize(w, h, false);
+        canvas.width = w * renderer.getPixelRatio();
+        canvas.height = h * renderer.getPixelRatio();
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      // -------------------- Main loop --------------------
+      const fpsEl = document.getElementById('fps');
+      let frames = 0, fpsT0 = performance.now();
+
+      function animate() {
+        tickFace();
+        // Low-pass filter the eye so micro-jitter in face tracking doesn't
+        // turn into visible judder on the tree.
+        eyeSmoothed.lerp(eye, 0.35);
+        updateOffAxisCamera(eyeSmoothed);
+
+        renderer.render(scene, camera);
+
+        frames++;
+        const now = performance.now();
+        if (now - fpsT0 > 500) {
+          fpsEl.textContent = (frames * 1000 / (now - fpsT0)).toFixed(0);
+          eyePosEl.textContent = `${eyeSmoothed.x.toFixed(2)}, ${eyeSmoothed.y.toFixed(2)}, ${eyeSmoothed.z.toFixed(2)}`;
+          frames = 0; fpsT0 = now;
+        }
+        requestAnimationFrame(animate);
+      }
+      animate();
+    </script>
+  </body>
+</html>
