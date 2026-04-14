@@ -80,6 +80,10 @@
         <button id="start-btn" class="btn">Enable Camera</button>
         <button id="calibrate-btn" class="btn secondary" hidden>Recenter</button>
       </div>
+      <div class="slider-row" id="camera-picker-row" hidden>
+        <span>Camera</span>
+        <select id="camera-picker" style="flex: 1; padding: 4px; border-radius: 6px; background: #1a2230; color: #e8eef5; border: 1px solid #3a4352;"></select>
+      </div>
       <div class="slider-row">
         <span>Scale</span>
         <input id="scale" type="range" min="0.2" max="4" step="0.05" value="1">
@@ -97,7 +101,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 20:14 UTC</div>
+    <div id="build-stamp">Build 2026-04-14 20:27 UTC</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -308,14 +312,15 @@
         // Request the camera FIRST so permission failures surface before
         // we pay the cost of downloading the MediaPipe model.
         faceStatusEl.textContent = 'accept camera prompt ↑';
-        console.info('[fishtank] requesting getUserMedia — click allow in Safari\'s address bar prompt');
+        console.info('[fishtank] requesting getUserMedia — click allow in the browser\'s permission prompt');
+        // Relaxed constraints: Chrome on Mac is notoriously slow when you
+        // specify facingMode or exact resolutions. Let the browser pick
+        // any camera, then we upgrade resolution and let the user swap
+        // cameras via the picker.
         const stream = await withTimeout(
-          navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-            audio: false
-          }),
+          navigator.mediaDevices.getUserMedia({ video: true, audio: false }),
           60000,
-          'Camera permission (check Safari\'s camera icon in the address bar, and macOS System Settings → Privacy & Security → Camera → Safari)'
+          'Camera permission (check the camera icon in the URL bar, and macOS System Settings → Privacy & Security → Camera → your browser)'
         );
         console.info('[fishtank] camera stream acquired');
 
@@ -346,6 +351,44 @@
         tracking = true;
         faceStatusEl.textContent = 'tracking';
         document.getElementById('calibrate-btn').hidden = false;
+        populateCameraPicker();
+      }
+
+      // Once we have permission we can enumerate devices (labels are
+      // only exposed after the user granted access). Populate a picker
+      // so the user can switch cameras without reloading.
+      async function populateCameraPicker() {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cams = devices.filter(d => d.kind === 'videoinput');
+          if (cams.length < 2) return;
+          const picker = document.getElementById('camera-picker');
+          picker.innerHTML = '';
+          for (const c of cams) {
+            const opt = document.createElement('option');
+            opt.value = c.deviceId;
+            opt.textContent = c.label || `Camera ${picker.children.length + 1}`;
+            picker.appendChild(opt);
+          }
+          // Set the current stream's device as selected.
+          const currentTrack = video.srcObject?.getVideoTracks()[0];
+          if (currentTrack) picker.value = currentTrack.getSettings().deviceId || cams[0].deviceId;
+          document.getElementById('camera-picker-row').hidden = false;
+
+          picker.addEventListener('change', async () => {
+            const deviceId = picker.value;
+            // Stop the old stream before starting a new one.
+            video.srcObject?.getTracks().forEach(t => t.stop());
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: deviceId } },
+              audio: false
+            });
+            video.srcObject = stream;
+            await video.play();
+          });
+        } catch (e) {
+          console.warn('[fishtank] enumerateDevices failed', e);
+        }
       }
 
       function tickFace() {
