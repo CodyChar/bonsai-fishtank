@@ -66,6 +66,60 @@
 
       .slider-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-top: 6px; }
       .slider-row input { flex: 1; }
+
+      /* -------------------- Calibration overlay -------------------- */
+      #cal-overlay {
+        position: fixed; inset: 0; pointer-events: none; z-index: 30;
+        display: none;
+      }
+      #cal-overlay.active { display: block; }
+      .cal-corner {
+        position: absolute; width: 56px; height: 56px;
+        border: 3px solid rgba(255,255,255,0.35);
+        border-radius: 50%;
+        background: rgba(0,0,0,0.25);
+        box-sizing: border-box;
+        transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+      }
+      .cal-corner.active {
+        border-color: #ffd76b;
+        border-width: 5px;
+        box-shadow: 0 0 0 6px rgba(255,215,107,0.25), 0 0 60px rgba(255,215,107,0.6);
+      }
+      .cal-corner.done {
+        border-color: #5ed694;
+        background: rgba(94,214,148,0.18);
+      }
+      #cal-tl { top: -28px; left: -28px; }
+      #cal-tr { top: -28px; right: -28px; }
+      #cal-br { bottom: -28px; right: -28px; }
+      #cal-bl { bottom: -28px; left: -28px; }
+      #cal-status {
+        position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        z-index: 31; pointer-events: auto;
+        background: rgba(10,14,22,0.88);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        padding: 22px 32px; border-radius: 16px;
+        text-align: center; font-weight: 500;
+        max-width: 460px;
+        display: none;
+      }
+      #cal-status.active { display: block; }
+      #cal-status .title { font-size: 14px; opacity: 0.7; margin-bottom: 8px; letter-spacing: 0.06em; text-transform: uppercase; }
+      #cal-status .countdown { font-size: 96px; font-weight: 700; line-height: 1; color: #ffd76b; margin: 4px 0; }
+      #cal-status .countdown.capture { color: #5ed694; font-size: 56px; }
+      #cal-status .instruction { font-size: 14px; opacity: 0.85; line-height: 1.45; }
+      #cal-status .secondary-row { margin-top: 12px; }
+      #cal-status code { color: #8cb3d9; }
+      #cal-status .residual { font-size: 12px; opacity: 0.7; margin-top: 8px; font-family: ui-monospace, Menlo, monospace; }
+      #cal-finger-marker {
+        position: fixed; width: 14px; height: 14px;
+        border: 2px solid #ff7bca; border-radius: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 32; pointer-events: none; display: none;
+        box-shadow: 0 0 12px #ff7bca;
+      }
     </style>
   </head>
   <body>
@@ -79,6 +133,7 @@
       <div>
         <button id="start-btn" class="btn">Enable Camera</button>
         <button id="calibrate-btn" class="btn secondary" hidden>Recenter</button>
+        <button id="corner-cal-btn" class="btn secondary" hidden>Calibrate Corners</button>
       </div>
       <div class="slider-row" id="camera-picker-row" hidden>
         <span>Camera</span>
@@ -141,7 +196,24 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 box front pinned</div>
+    <div id="build-stamp">Build 2026-04-14 corner cal v1</div>
+
+    <div id="cal-overlay">
+      <div class="cal-corner" id="cal-tl" data-corner="TL"></div>
+      <div class="cal-corner" id="cal-tr" data-corner="TR"></div>
+      <div class="cal-corner" id="cal-br" data-corner="BR"></div>
+      <div class="cal-corner" id="cal-bl" data-corner="BL"></div>
+    </div>
+    <div id="cal-status">
+      <div class="title">Corner calibration</div>
+      <div class="countdown" id="cal-countdown">3</div>
+      <div class="instruction" id="cal-instruction">Hold your right index finger at full arm's length, line it up with the highlighted corner so your right eye, fingertip, and the corner are colinear.</div>
+      <div class="residual" id="cal-residual"></div>
+      <div class="secondary-row">
+        <button class="btn secondary" id="cal-cancel">Cancel</button>
+      </div>
+    </div>
+    <div id="cal-finger-marker"></div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -151,7 +223,7 @@
       import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
       import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
       import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-      import { FilesetResolver, FaceLandmarker } from
+      import { FilesetResolver, FaceLandmarker, HandLandmarker } from
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/vision_bundle.mjs';
 
       // -------------------- Scene --------------------
@@ -719,6 +791,15 @@
       // webcam calibration varies wildly. A slider lets the user tune.
       let userScale = 1.0;
 
+      // Position of the webcam in our world coords, defaulting to "directly
+      // above the canvas top, in the screen plane". Corner calibration
+      // overwrites this with the real measured offset.
+      const webcamWorldPos = new THREE.Vector3(0, screen.heightMeters / 2, 0);
+
+      // Empirical assumption used when re-projecting the hand fingertip
+      // image position into camera coords: typical webcam horizontal FOV.
+      const ASSUMED_HFOV_DEG = 60;
+
       function withTimeout(promise, ms, label) {
         return Promise.race([
           promise,
@@ -762,10 +843,10 @@
         await video.play();
 
         faceStatusEl.textContent = 'loading model…';
-        const vision = await FilesetResolver.forVisionTasks(
+        visionRef = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/wasm'
         );
-        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        faceLandmarker = await FaceLandmarker.createFromOptions(visionRef, {
           baseOptions: {
             modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
             delegate: 'GPU'
@@ -785,7 +866,28 @@
         tracking = true;
         faceStatusEl.textContent = 'tracking';
         document.getElementById('calibrate-btn').hidden = false;
+        document.getElementById('corner-cal-btn').hidden = false;
         populateCameraPicker();
+      }
+
+      // Lazy-loaded HandLandmarker: only fetched the first time the user
+      // hits "Calibrate Corners". Saves the model download for everyone
+      // who never calibrates.
+      let handLandmarker = null;
+      let visionRef = null;
+      async function ensureHandLandmarker() {
+        if (handLandmarker) return handLandmarker;
+        if (!visionRef) throw new Error('Camera not started yet');
+        handLandmarker = await HandLandmarker.createFromOptions(visionRef, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'GPU'
+          },
+          runningMode: 'VIDEO',
+          numHands: 1
+        });
+        console.info('[fishtank] hand landmarker ready');
+        return handLandmarker;
       }
 
       // Once we have permission we can enumerate devices (labels are
@@ -834,6 +936,10 @@
 
       function tickFace() {
         if (!tracking || !faceLandmarker || video.readyState < 2) return;
+        // Pause the regular face detection while a calibration capture is
+        // running — the calibration loop calls the same model with its
+        // own timestamps and MediaPipe rejects non-monotonic ones.
+        if (calibratingCorners) return;
         if (video.currentTime === lastVideoTime) return;
         lastVideoTime = video.currentTime;
 
@@ -880,9 +986,9 @@
           const camY = -ty * u;
           const camZ = Math.abs(tz) * u;
 
-          const wx = camX;
-          const wy = screen.heightMeters / 2 + camY;
-          const wz = camZ * userScale;
+          const wx = webcamWorldPos.x + camX;
+          const wy = webcamWorldPos.y + camY;
+          const wz = webcamWorldPos.z + camZ * userScale;
           eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
           _fallbackStreak = 0;
@@ -904,9 +1010,9 @@
           const depth = realIPD * f_px / irisPixelDist;
           const camX = -((mx - 0.5) * vw) * realIPD / irisPixelDist;
           const camY = -((my - 0.5) * vh) * realIPD / irisPixelDist;
-          const wx = camX;
-          const wy = screen.heightMeters / 2 + camY;
-          const wz = depth * userScale;
+          const wx = webcamWorldPos.x + camX;
+          const wy = webcamWorldPos.y + camY;
+          const wz = webcamWorldPos.z + depth * userScale;
           eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
           _fallbackStreak++;
@@ -933,6 +1039,311 @@
         scaleVal.textContent = userScale.toFixed(2);
         calibrationOffset.set(camX, camY, 0);
       });
+
+      // -------------------- Corner calibration --------------------
+      // The user holds their right index finger at full arm's length and
+      // visually lines it up so {right eye → fingertip → screen corner}
+      // are colinear. We capture eye + finger 3D positions in CAMERA
+      // coords for each of the 4 corners, intersect each ray with the
+      // z=0 plane (camera-relative), and read off the screen rectangle's
+      // width plus the webcam's offset relative to it. Closed-form least-
+      // squares because the corner pattern is symmetric.
+      //
+      // Assumptions:
+      //   • Camera +Z aligns with our world +Z (true for standard webcam mount).
+      //   • Webcam is roughly in the screen plane (dz≈0). For laptops with
+      //     a top-bezel camera this is within a few mm.
+      //   • Real index-finger MCP-to-tip distance ≈ 7.5 cm, used to
+      //     estimate fingertip depth from its observed pixel length.
+
+      const REAL_INDEX_LEN = 0.075;
+      const calBtn = document.getElementById('corner-cal-btn');
+      const calOverlay = document.getElementById('cal-overlay');
+      const calStatus = document.getElementById('cal-status');
+      const calCountdownEl = document.getElementById('cal-countdown');
+      const calInstructionEl = document.getElementById('cal-instruction');
+      const calResidualEl = document.getElementById('cal-residual');
+      const calCancelBtn = document.getElementById('cal-cancel');
+      const fingerMarker = document.getElementById('cal-finger-marker');
+
+      let calibratingCorners = false;
+      let calCancelled = false;
+      let isCornerCalibrated = false;
+      let lastHandTime = -1;
+
+      function sleep(ms) {
+        return new Promise(r => setTimeout(r, ms));
+      }
+      function showCalOverlay() {
+        calOverlay.classList.add('active');
+        calStatus.classList.add('active');
+        for (const k of ['tl','tr','br','bl']) {
+          const el = document.getElementById('cal-' + k);
+          el.classList.remove('active', 'done');
+        }
+        calResidualEl.textContent = '';
+      }
+      function hideCalOverlay() {
+        calOverlay.classList.remove('active');
+        calStatus.classList.remove('active');
+        fingerMarker.style.display = 'none';
+      }
+      function activateCornerTarget(corner) {
+        for (const k of ['tl','tr','br','bl']) {
+          const el = document.getElementById('cal-' + k);
+          el.classList.toggle('active', k === corner.toLowerCase());
+        }
+      }
+      function setCornerDone(corner) {
+        const el = document.getElementById('cal-' + corner.toLowerCase());
+        el.classList.add('done');
+        el.classList.remove('active');
+      }
+      function setCountdown(text, capture = false) {
+        calCountdownEl.textContent = text;
+        calCountdownEl.classList.toggle('capture', capture);
+      }
+      function setInstruction(text) { calInstructionEl.textContent = text; }
+
+      // Capture one calibration sample from the current video frame.
+      // Returns null if face or hand isn't detected reliably.
+      function captureCalibrationSample() {
+        if (video.readyState < 2) return null;
+        const t = performance.now();
+        const faceResult = faceLandmarker.detectForVideo(video, t);
+        // Hand landmarker insists on monotonic-increasing timestamps even
+        // across model instances, hence the +1 offset to avoid collisions.
+        let handResult = null;
+        if (t > lastHandTime) {
+          handResult = handLandmarker.detectForVideo(video, t);
+          lastHandTime = t;
+        }
+        const xform = faceResult.facialTransformationMatrixes?.[0];
+        const hand = handResult?.landmarks?.[0];
+        if (!xform || !hand) return null;
+
+        const m = xform.data;
+        const tx = m[12], ty = m[13], tz = m[14];
+        const u = Math.abs(tz) > 5 ? 0.01 : 1.0;
+        const eyeCam = new THREE.Vector3(-tx * u, -ty * u, Math.abs(tz) * u);
+
+        const tip = hand[8], mcp = hand[5];
+        if (!tip || !mcp) return null;
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const f_px = vw / (2 * Math.tan((ASSUMED_HFOV_DEG / 2) * Math.PI / 180));
+        const dxPx = (tip.x - mcp.x) * vw;
+        const dyPx = (tip.y - mcp.y) * vh;
+        const fingerPxLen = Math.hypot(dxPx, dyPx);
+        if (fingerPxLen < 6) return null;
+
+        const fingerCamZ = REAL_INDEX_LEN * f_px / fingerPxLen;
+        const fingerCamX = -((tip.x - 0.5) * vw) / f_px * fingerCamZ;
+        const fingerCamY = -((tip.y - 0.5) * vh) / f_px * fingerCamZ;
+        const fingerCam = new THREE.Vector3(fingerCamX, fingerCamY, fingerCamZ);
+
+        // Update HUD finger marker (preview is mirrored, so flip x).
+        const previewW = 180, previewH = 135;
+        const previewLeft = window.innerWidth - 12 - previewW;
+        const previewTop = window.innerHeight - 12 - previewH;
+        fingerMarker.style.left = (previewLeft + (1 - tip.x) * previewW) + 'px';
+        fingerMarker.style.top = (previewTop + tip.y * previewH) + 'px';
+        fingerMarker.style.display = 'block';
+
+        return { eyeCam, fingerCam };
+      }
+
+      function averageSamples(arr) {
+        const eye = new THREE.Vector3(), finger = new THREE.Vector3();
+        for (const s of arr) { eye.add(s.eyeCam); finger.add(s.fingerCam); }
+        eye.divideScalar(arr.length); finger.divideScalar(arr.length);
+        return { eyeCam: eye, fingerCam: finger };
+      }
+
+      function solveCornerCalibration(samples) {
+        // Project each eye→finger ray onto the z=0 plane in camera-
+        // relative world-aligned coords. Each hit point lands at the
+        // corresponding screen corner, expressed as offset from the
+        // webcam.
+        const hits = {};
+        for (const k of ['TL', 'TR', 'BR', 'BL']) {
+          const { eyeCam, fingerCam } = samples[k];
+          const dz = fingerCam.z - eyeCam.z;
+          if (Math.abs(dz) < 0.005) return { ok: false, reason: 'finger depth too close to eye depth — fingertip not at arm length?' };
+          const t = (0 - eyeCam.z) / dz;
+          if (t < 1) return { ok: false, reason: 'corner ' + k + ': eye-finger ray points away from screen plane' };
+          hits[k] = new THREE.Vector3(
+            eyeCam.x + t * (fingerCam.x - eyeCam.x),
+            eyeCam.y + t * (fingerCam.y - eyeCam.y),
+            0
+          );
+        }
+
+        // Symmetric closed-form: each corner in camera coords is
+        //   (sx*W/2 - dx, sy*H/2 - dy, 0)
+        // sum of x's eliminates sx (=±1 balanced) → mean = -dx → dx = -mean
+        // diff (TR.x - TL.x) ≈ W (and similarly BR.x - BL.x); average for stability
+        const dxWeb = -((hits.TL.x + hits.TR.x + hits.BR.x + hits.BL.x) / 4);
+        const dyWeb = -((hits.TL.y + hits.TR.y + hits.BR.y + hits.BL.y) / 4);
+        const W_x = ((hits.TR.x - hits.TL.x) + (hits.BR.x - hits.BL.x)) / 2;
+        const aspect = window.innerHeight / window.innerWidth;
+        const W_y = ((hits.TL.y - hits.BL.y) + (hits.TR.y - hits.BR.y)) / (2 * aspect);
+        const W = (W_x + W_y) / 2;
+
+        // Residual: how much each measured hit deviates from a perfect rectangle
+        let residual = 0;
+        const expected = {
+          TL: { x: -W/2 - dxWeb, y: +aspect*W/2 - dyWeb },
+          TR: { x: +W/2 - dxWeb, y: +aspect*W/2 - dyWeb },
+          BR: { x: +W/2 - dxWeb, y: -aspect*W/2 - dyWeb },
+          BL: { x: -W/2 - dxWeb, y: -aspect*W/2 - dyWeb },
+        };
+        for (const k of ['TL','TR','BR','BL']) {
+          residual += Math.hypot(hits[k].x - expected[k].x, hits[k].y - expected[k].y);
+        }
+        residual /= 4;
+        return { ok: true, W, dxWeb, dyWeb, residual, hits };
+      }
+
+      function applyCornerCalibration(sol) {
+        if (!isFinite(sol.W) || sol.W <= 0.05 || sol.W > 2.0) {
+          return { ok: false, reason: 'implausible width ' + sol.W.toFixed(3) + ' m' };
+        }
+        screen.widthMeters = sol.W;
+        webcamWorldPos.set(sol.dxWeb, sol.dyWeb, 0);
+        isCornerCalibrated = true;
+
+        const cm = sol.W * 100;
+        if (cm >= 15 && cm <= 80) {
+          screenWInput.value = cm.toFixed(1);
+          screenWVal.textContent = cm.toFixed(1);
+        }
+        rebuildWindowBox();
+
+        try {
+          localStorage.setItem('bonsaiFishtankCal', JSON.stringify({
+            W: sol.W,
+            wx: sol.dxWeb, wy: sol.dyWeb, wz: 0,
+            ts: Date.now()
+          }));
+        } catch (e) { /* localStorage may be disabled */ }
+        return { ok: true };
+      }
+
+      function tryRestoreCalibration() {
+        try {
+          const raw = localStorage.getItem('bonsaiFishtankCal');
+          if (!raw) return;
+          const d = JSON.parse(raw);
+          if (typeof d.W !== 'number') return;
+          screen.widthMeters = d.W;
+          webcamWorldPos.set(d.wx || 0, d.wy ?? screen.heightMeters / 2, d.wz || 0);
+          isCornerCalibrated = true;
+          const cm = d.W * 100;
+          if (cm >= 15 && cm <= 80) {
+            screenWInput.value = cm.toFixed(1);
+            screenWVal.textContent = cm.toFixed(1);
+          }
+          rebuildWindowBox();
+          console.info('[fishtank] restored corner calibration from', new Date(d.ts).toLocaleString(), d);
+        } catch (e) {
+          console.warn('[fishtank] failed to restore calibration', e);
+        }
+      }
+      // Note: tryRestoreCalibration() is invoked at the bottom of the
+      // script (after slider DOM refs are grabbed) to avoid the TDZ.
+
+      async function runCornerCalibration() {
+        if (!tracking) return;
+        if (calibratingCorners) return;
+        calibratingCorners = true;
+        calCancelled = false;
+
+        showCalOverlay();
+        setInstruction('Loading hand model…');
+        setCountdown('…');
+        try {
+          await ensureHandLandmarker();
+        } catch (e) {
+          setInstruction('Failed to load hand model: ' + e.message);
+          await sleep(2500);
+          hideCalOverlay();
+          calibratingCorners = false;
+          return;
+        }
+        if (calCancelled) { hideCalOverlay(); calibratingCorners = false; return; }
+
+        setInstruction('Hold your right index finger at full arm\'s length. Line it up so your right eye, fingertip, and the highlighted corner are all in a straight line.');
+        setCountdown('READY');
+        await sleep(2500);
+
+        const corners = ['TL', 'TR', 'BR', 'BL'];
+        const samples = {};
+        for (const corner of corners) {
+          if (calCancelled) break;
+          activateCornerTarget(corner);
+          for (let i = 3; i > 0; i--) {
+            if (calCancelled) break;
+            setCountdown(String(i));
+            await sleep(900);
+          }
+          if (calCancelled) break;
+          setCountdown('SNAP', true);
+          const captured = [];
+          const t0 = performance.now();
+          while (performance.now() - t0 < 600) {
+            const cap = captureCalibrationSample();
+            if (cap) captured.push(cap);
+            await sleep(40);
+          }
+          if (captured.length < 4) {
+            setInstruction(`Couldn't see your hand for ${corner}. Make sure your fingertip is in the camera's view, then try again.`);
+            await sleep(2500);
+            hideCalOverlay();
+            calibratingCorners = false;
+            return;
+          }
+          samples[corner] = averageSamples(captured);
+          setCornerDone(corner);
+          await sleep(250);
+        }
+        if (calCancelled) { hideCalOverlay(); calibratingCorners = false; return; }
+
+        const sol = solveCornerCalibration(samples);
+        if (!sol.ok) {
+          setInstruction('Calibration failed: ' + sol.reason);
+          setCountdown('✗');
+          await sleep(3500);
+          hideCalOverlay();
+          calibratingCorners = false;
+          return;
+        }
+        const apply = applyCornerCalibration(sol);
+        if (!apply.ok) {
+          setInstruction('Calibration failed: ' + apply.reason);
+          setCountdown('✗');
+          await sleep(3500);
+          hideCalOverlay();
+          calibratingCorners = false;
+          return;
+        }
+
+        setCountdown('✓');
+        setInstruction('Calibration complete');
+        calResidualEl.textContent =
+          `width = ${(sol.W * 100).toFixed(1)} cm   webcam = (${(sol.dxWeb * 100).toFixed(1)}, ${(sol.dyWeb * 100).toFixed(1)}) cm   residual = ${(sol.residual * 100).toFixed(2)} cm`;
+        await sleep(3500);
+        hideCalOverlay();
+        calibratingCorners = false;
+      }
+
+      calBtn.addEventListener('click', () => {
+        runCornerCalibration().catch(e => {
+          console.error('[fishtank] calibration error', e);
+          setInstruction('Error: ' + e.message);
+          setTimeout(() => { hideCalOverlay(); calibratingCorners = false; }, 3000);
+        });
+      });
+      calCancelBtn.addEventListener('click', () => { calCancelled = true; });
 
       document.getElementById('start-btn').addEventListener('click', (ev) => {
         ev.currentTarget.disabled = true;
@@ -1098,6 +1509,11 @@
         requestAnimationFrame(animate);
       }
       animate();
+
+      // Restore any persisted corner calibration now that all DOM refs
+      // and helpers are in scope. Safe to call before the user enables
+      // the camera — only updates screen.widthMeters + webcamWorldPos.
+      tryRestoreCalibration();
     </script>
   </body>
 </html>
