@@ -101,11 +101,16 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 20:27 UTC</div>
+    <div id="build-stamp">Build 2026-04-14 lit + bloom + parallax</div>
 
     <script type="module">
       import * as THREE from 'three';
       import { USDZLoader } from 'three/addons/loaders/USDZLoader.js';
+      import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+      import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+      import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+      import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+      import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       import { FilesetResolver, FaceLandmarker } from
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/vision_bundle.mjs';
 
@@ -114,50 +119,248 @@
       const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
       renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.35;
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x12161d);
+
+      // Procedural sky gradient — a vertex-coloured inverted icosahedron
+      // sitting at world distance ~5 m. Cheaper than a CubeRenderTarget
+      // and gives us full control over the palette.
+      function makeSky(top, bot) {
+        const g = new THREE.IcosahedronGeometry(5, 2);
+        const colors = new Float32Array(g.attributes.position.count * 3);
+        const v = new THREE.Vector3();
+        const cTop = new THREE.Color(top), cBot = new THREE.Color(bot);
+        for (let i = 0; i < g.attributes.position.count; i++) {
+          v.fromBufferAttribute(g.attributes.position, i).normalize();
+          const t = THREE.MathUtils.smoothstep(v.y, -0.3, 0.6);
+          const c = cBot.clone().lerp(cTop, t);
+          colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
+        }
+        g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        const m = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, depthWrite: false, fog: false });
+        const mesh = new THREE.Mesh(g, m);
+        mesh.frustumCulled = false;
+        return mesh;
+      }
+      const sky = makeSky(0xb9d4ea, 0xe8c79a); // soft dawn / overcast haze
+      scene.add(sky);
+
+      // Image-based lighting from a generated room environment so PBR
+      // materials have realistic specular reflections without us having
+      // to ship an HDRI.
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+      // Subtle distance fog — gives the dust and god-rays something to
+      // sit against and softens the back of the scene.
+      scene.fog = new THREE.Fog(0xc7d4e2, 0.6, 3.5);
 
       // Off-axis camera — projection matrix is rebuilt each frame based on
       // the viewer's eye position relative to the screen rectangle.
       const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 10);
 
-      // Lighting
-      scene.add(new THREE.HemisphereLight(0xfff2d0, 0x2a2118, 0.55));
-      const sun = new THREE.DirectionalLight(0xffd7a0, 2.2);
+      // Lighting — bright key + warm fill + cool rim, balanced for ACES.
+      scene.add(new THREE.HemisphereLight(0xfff2d0, 0x59513f, 1.1));
+      const sun = new THREE.DirectionalLight(0xffd7a0, 4.5);
       sun.position.set(-0.6, 1.2, 0.8);
       sun.castShadow = true;
-      sun.shadow.mapSize.set(1024, 1024);
+      sun.shadow.mapSize.set(2048, 2048);
       sun.shadow.camera.left = -0.5; sun.shadow.camera.right = 0.5;
       sun.shadow.camera.top = 0.5; sun.shadow.camera.bottom = -0.5;
+      sun.shadow.camera.near = 0.1; sun.shadow.camera.far = 5;
       sun.shadow.bias = -0.0005;
+      sun.shadow.normalBias = 0.02;
       scene.add(sun);
+
+      const fill = new THREE.DirectionalLight(0xb8d4ff, 1.2);
+      fill.position.set(0.8, 0.6, 0.4);
+      scene.add(fill);
+
+      const rim = new THREE.DirectionalLight(0xffe0b3, 1.6);
+      rim.position.set(0.2, 0.8, -1.0);
+      scene.add(rim);
+
+      // Direction from world origin to the sun — used by the volumetric
+      // shafts and dust glint shaders so the atmosphere lines up with the
+      // key light. Ported from the AVP_AI_Experiments scene; sizes are
+      // shrunk ~10× because this world is fishtank-scale (~0.3 m), not
+      // room-scale (~4 m).
+      const sunDir = sun.position.clone().normalize();
+
+      // -------------------- God rays --------------------
+      // Instanced additive slabs fanning from the sun, each modulated by
+      // a value-noise shader so the shafts shimmer.
+      const shaftMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: new THREE.Color(0xffe4a8) }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }`,
+        fragmentShader: `
+          varying vec2 vUv;
+          uniform float uTime;
+          uniform vec3 uColor;
+          float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+          float vnoise(vec2 p) {
+            vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f);
+            return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+                       mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+          }
+          void main() {
+            float n = vnoise(vec2(vUv.x * 3.0, vUv.y * 1.5 - uTime * 0.25));
+            n = smoothstep(0.35, 1.0, n);
+            float edge = smoothstep(0.0, 0.2, vUv.x) * smoothstep(0.0, 0.2, 1.0 - vUv.x);
+            float fade = smoothstep(0.0, 0.25, vUv.y) * smoothstep(0.0, 0.4, 1.0 - vUv.y);
+            float a = n * edge * fade * 0.55;
+            gl_FragColor = vec4(uColor * 1.4, a);
+          }`
+      });
+
+      const SHAFT_COUNT = 28;
+      const shaftMesh = new THREE.InstancedMesh(
+        new THREE.PlaneGeometry(0.04, 1.0),
+        shaftMat,
+        SHAFT_COUNT
+      );
+      shaftMesh.frustumCulled = false;
+      {
+        const dummy = new THREE.Object3D();
+        const up = Math.abs(sunDir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+        const perpA = new THREE.Vector3().crossVectors(sunDir, up).normalize();
+        const perpB = new THREE.Vector3().crossVectors(sunDir, perpA).normalize();
+        const sunPos = sunDir.clone().multiplyScalar(0.4);
+        for (let i = 0; i < SHAFT_COUNT; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.random() * 0.16;
+          dummy.position.copy(sunPos);
+          dummy.position.add(perpA.clone().multiplyScalar(Math.cos(a) * r));
+          dummy.position.add(perpB.clone().multiplyScalar(Math.sin(a) * r));
+          dummy.position.add(sunDir.clone().multiplyScalar(-Math.random() * 0.25));
+          dummy.lookAt(dummy.position.clone().add(sunDir));
+          dummy.rotateZ(Math.random() * Math.PI);
+          dummy.scale.set(0.3 + Math.random() * 0.4, 1.2 + Math.random() * 2.0, 1);
+          dummy.updateMatrix();
+          shaftMesh.setMatrixAt(i, dummy.matrix);
+        }
+        shaftMesh.instanceMatrix.needsUpdate = true;
+      }
+      // Parented to the diorama below so rays sit behind the window plane.
+
+      // -------------------- Dust motes --------------------
+      // Instanced billboarded quads with a soft circular falloff and a
+      // view-aligned glint when the camera looks toward the sun.
+      const DUST_COUNT = 420;
+      const dustGeo = new THREE.PlaneGeometry(0.007, 0.007);
+      const dustPhases = new Float32Array(DUST_COUNT);
+      for (let i = 0; i < DUST_COUNT; i++) dustPhases[i] = Math.random();
+      dustGeo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(dustPhases, 1));
+
+      const dustMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uSunDir: { value: sunDir }
+        },
+        vertexShader: `
+          uniform float uTime;
+          attribute float aPhase;
+          varying vec2 vUv;
+          varying vec3 vViewDir;
+          void main() {
+            vUv = uv;
+            float t = uTime + aPhase * 6.283;
+            vec3 bob = vec3(sin(t * 0.7) * 0.005, cos(t * 0.5) * 0.006, sin(t * 0.6) * 0.005);
+            vec4 mv = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+            mv.xyz += bob;
+            vec4 world = modelMatrix * mv;
+            vViewDir = normalize(cameraPosition - world.xyz);
+            vec4 mvPos = viewMatrix * world;
+            mvPos.xy += position.xy;
+            gl_Position = projectionMatrix * mvPos;
+          }`,
+        fragmentShader: `
+          varying vec2 vUv;
+          varying vec3 vViewDir;
+          uniform vec3 uSunDir;
+          void main() {
+            vec2 d = vUv - vec2(0.5);
+            float r = dot(d, d) * 4.0;
+            float shape = smoothstep(1.0, 0.0, r);
+            float glint = max(0.0, dot(vViewDir, -uSunDir));
+            glint = pow(glint, 4.0);
+            float a = shape * (0.18 + glint * 1.6);
+            gl_FragColor = vec4(1.0, 0.94, 0.82, a);
+          }`
+      });
+
+      const dustMesh = new THREE.InstancedMesh(dustGeo, dustMat, DUST_COUNT);
+      dustMesh.frustumCulled = false;
+      {
+        const dummy = new THREE.Object3D();
+        for (let i = 0; i < DUST_COUNT; i++) {
+          const r = Math.pow(Math.random(), 0.55) * 0.4;
+          const theta = Math.random() * Math.PI * 2;
+          const y = -0.18 + Math.random() * 0.55;
+          dummy.position.set(Math.cos(theta) * r, y, Math.sin(theta) * r);
+          dummy.scale.setScalar(0.5 + Math.random() * 1.6);
+          dummy.updateMatrix();
+          dustMesh.setMatrixAt(i, dummy.matrix);
+        }
+        dustMesh.instanceMatrix.needsUpdate = true;
+      }
+      // Parented to the diorama below so motes float behind the window plane.
+
+      // The diorama is parented to a single group so we can shove the
+      // whole thing behind the screen plane in one go. Anything inside
+      // diorama.position.z = -0.25 sits ~25 cm "into" the window — that's
+      // what makes head movement actually look like parallax instead of a
+      // sticker rotating on the screen.
+      const diorama = new THREE.Group();
+      diorama.position.set(0, 0, -0.25);
+      scene.add(diorama);
 
       // Ground / pedestal — the "floor of the fishtank"
       const pedestal = new THREE.Mesh(
         new THREE.CylinderGeometry(0.18, 0.2, 0.04, 48),
-        new THREE.MeshStandardMaterial({ color: 0x2a1f16, roughness: 0.85 })
+        new THREE.MeshStandardMaterial({ color: 0x6b4a2c, roughness: 0.7, metalness: 0.05 })
       );
       pedestal.position.y = -0.18;
       pedestal.receiveShadow = true;
       pedestal.castShadow = true;
-      scene.add(pedestal);
+      diorama.add(pedestal);
 
       const floor = new THREE.Mesh(
         new THREE.CircleGeometry(0.8, 64),
-        new THREE.MeshStandardMaterial({ color: 0x181c23, roughness: 0.95 })
+        new THREE.MeshStandardMaterial({ color: 0x6e7a86, roughness: 0.9 })
       );
       floor.rotation.x = -Math.PI / 2;
       floor.position.y = -0.2;
       floor.receiveShadow = true;
-      scene.add(floor);
+      diorama.add(floor);
 
-      // Bonsai placeholder — swapped out if ./bonsai.glb exists
+      // Bonsai placeholder — swapped out when ./bonsai.usdz loads.
       const bonsaiGroup = new THREE.Group();
-      scene.add(bonsaiGroup);
+      diorama.add(bonsaiGroup);
       buildPrimitiveBonsai(bonsaiGroup);
+
+      // Now that the diorama exists, drop the atmospheric layers in.
+      diorama.add(shaftMesh);
+      diorama.add(dustMesh);
 
       function buildPrimitiveBonsai(parent) {
         parent.clear();
@@ -451,9 +654,19 @@
       }
 
       document.getElementById('calibrate-btn').addEventListener('click', () => {
-        // Zero out lateral + vertical drift; keep the measured depth.
-        calibrationOffset.x = eye.x;
-        calibrationOffset.y = eye.y - screen.heightMeters / 2;
+        // Recover the raw (pre-scale, pre-offset) measurements from the
+        // current eye, then re-anchor: depth → 0.5 m via userScale, and
+        // lateral / vertical → 0 via the offsets. After this, the user's
+        // current head pose IS the "natural sit-back" pose, regardless of
+        // what their webcam HFOV actually is.
+        const TARGET_DEPTH = 0.5;
+        const camX = (eye.x + calibrationOffset.x) / userScale;
+        const camY = (eye.y - screen.heightMeters / 2 + calibrationOffset.y) / userScale;
+        const camZ = Math.max(0.05, (eye.z + calibrationOffset.z) / userScale);
+        userScale = THREE.MathUtils.clamp(TARGET_DEPTH / camZ, 0.2, 4);
+        scaleInput.value = userScale.toFixed(2);
+        scaleVal.textContent = userScale.toFixed(2);
+        calibrationOffset.set(camX * userScale, camY * userScale, 0);
       });
 
       document.getElementById('start-btn').addEventListener('click', (ev) => {
@@ -486,10 +699,27 @@
         screenWVal.textContent = screenWInput.value;
       });
 
+      // -------------------- Post-processing --------------------
+      // EffectComposer pipeline so future effects (DOF, SSR, vignette) can
+      // slot in as additional passes without touching the main loop.
+      // Bloom gives the god-rays and dust a soft glow that sells them as
+      // light, not just translucent quads.
+      const composer = new EffectComposer(renderer);
+      composer.addPass(new RenderPass(scene, camera));
+      const bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(window.innerWidth, window.innerHeight),
+        0.7,   // strength
+        0.75,  // radius
+        0.85   // threshold — only the brightest pixels (sun, glints) bloom
+      );
+      composer.addPass(bloomPass);
+      composer.addPass(new OutputPass());
+
       // -------------------- Resize --------------------
       function resize() {
         const w = window.innerWidth, h = window.innerHeight;
         renderer.setSize(w, h, false);
+        composer.setSize(w, h);
         canvas.width = w * renderer.getPixelRatio();
         canvas.height = h * renderer.getPixelRatio();
       }
@@ -499,6 +729,7 @@
       // -------------------- Main loop --------------------
       const fpsEl = document.getElementById('fps');
       let frames = 0, fpsT0 = performance.now();
+      const clock = new THREE.Clock();
 
       function animate() {
         tickFace();
@@ -507,7 +738,11 @@
         eyeSmoothed.lerp(eye, 0.35);
         updateOffAxisCamera(eyeSmoothed);
 
-        renderer.render(scene, camera);
+        const dt = clock.getDelta();
+        shaftMat.uniforms.uTime.value += dt;
+        dustMat.uniforms.uTime.value += dt;
+
+        composer.render();
 
         frames++;
         const now = performance.now();
