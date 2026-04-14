@@ -146,7 +146,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 box-z slider</div>
+    <div id="build-stamp">Build 2026-04-14 PnP head pose</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -771,7 +771,12 @@
           runningMode: 'VIDEO',
           numFaces: 1,
           outputFaceBlendshapes: false,
-          outputFacialTransformationMatrixes: false
+          // The facial transformation matrix is solved (PnP-style) against
+          // the entire visible canonical face mesh, so it stays stable
+          // when one eye is occluded or the head rotates past the point
+          // where iris-distance-based depth foreshortens. We use it as
+          // the primary head-pose signal in tickFace().
+          outputFacialTransformationMatrixes: true
         });
         console.info('[fishtank] face landmarker ready');
 
@@ -818,6 +823,13 @@
         }
       }
 
+      // Logged once after first successful matrix read so we can sanity-
+      // check the unit + sign convention from the browser console.
+      let _matrixLogged = false;
+      // Counts how many consecutive frames we've fallen back to iris-
+      // based depth — used as a soft hint in the HUD.
+      let _fallbackStreak = 0;
+
       function tickFace() {
         if (!tracking || !faceLandmarker || video.readyState < 2) return;
         if (video.currentTime === lastVideoTime) return;
@@ -826,57 +838,78 @@
         const result = faceLandmarker.detectForVideo(video, performance.now());
         const landmarks = result.faceLandmarks?.[0];
         if (!landmarks) { faceStatusEl.textContent = 'no face'; return; }
-        faceStatusEl.textContent = 'tracking';
 
-        // Iris centers are landmarks 468 (right) and 473 (left) when
-        // Face Landmarker is configured with iris refinement (default).
-        // Using them gives us the exact inter-pupillary midpoint, which
-        // is where a viewer's "eye" effectively is for a fishtank-VR
-        // illusion, and lets us derive depth geometrically from the
-        // known inter-pupillary distance — no brittle matrix unit
-        // conventions.
+        // Iris midpoint is still useful for the HUD preview dot regardless
+        // of which depth path we take. Iris refinement is on by default in
+        // Face Landmarker → landmarks 468 (right) and 473 (left).
         const rIris = landmarks[468];
         const lIris = landmarks[473];
-        if (!rIris || !lIris) { faceStatusEl.textContent = 'no iris'; return; }
+        const mx = rIris && lIris ? (rIris.x + lIris.x) / 2 : 0.5;
+        const my = rIris && lIris ? (rIris.y + lIris.y) / 2 : 0.5;
 
-        const mx = (rIris.x + lIris.x) / 2;
-        const my = (rIris.y + lIris.y) / 2;
+        // -------------------- PRIMARY: head-pose matrix --------------------
+        // The facial transformation matrix is computed by PnP-solving the
+        // canonical face model against the visible 478 landmarks. That's
+        // robust against:
+        //   • One eye occluded by head rotation (the matrix still has
+        //     plenty of constraints from cheek + jaw + nose landmarks).
+        //   • Head yaw foreshortening the IPD (the IPD-pixel-distance →
+        //     depth pinhole shortcut blows up here; the matrix doesn't).
+        // Translation lives at column 3 of a column-major Float32Array:
+        //   data[12] = tx, data[13] = ty, data[14] = tz.
+        const xform = result.facialTransformationMatrixes?.[0];
+        if (xform && xform.data) {
+          const m = xform.data;
+          const tx = m[12], ty = m[13], tz = m[14];
+          // Auto-detect units: canonical face model is in cm in some
+          // builds, m in others. >5 in magnitude almost certainly means cm.
+          const u = Math.abs(tz) > 5 ? 0.01 : 1.0;
 
-        const vw = video.videoWidth, vh = video.videoHeight;
-        const dxPx = (rIris.x - lIris.x) * vw;
-        const dyPx = (rIris.y - lIris.y) * vh;
-        const irisPixelDist = Math.hypot(dxPx, dyPx);
-        if (irisPixelDist < 4) return;
+          if (!_matrixLogged) {
+            console.info('[fishtank] face matrix translation', tx.toFixed(3), ty.toFixed(3), tz.toFixed(3),
+                         '→ unit scale', u, '→ depth ≈', (Math.abs(tz) * u).toFixed(3), 'm');
+            _matrixLogged = true;
+          }
 
-        // Pinhole model: from known real inter-pupillary distance and
-        // observed pixel distance, recover metric depth.
-        const realIPD = 0.063;              // meters, average adult IPD
-        const assumedFovDeg = 60;           // typical laptop webcam HFOV
-        const f_px = vw / (2 * Math.tan((assumedFovDeg / 2) * Math.PI / 180));
-        const depth = realIPD * f_px / irisPixelDist;   // meters
+          // Sign mapping into our world: webcam un-mirrored → image-right
+          // is user-left, so we flip X. Image Y points down; world Y is
+          // up, so we flip Y. Z magnitude is camera-to-face distance.
+          const camX = -tx * u;
+          const camY = -ty * u;
+          const camZ = Math.abs(tz) * u;
 
-        // Iris midpoint → camera-space coords. Webcam captures a non-
-        // mirrored image, so moving your head right shows you moving
-        // left in the frame. We negate X to put the eye on the correct
-        // side of the world.
-        //
-        // Note: the f_px terms cancel out because depth itself scales
-        // with f_px in exactly the inverse way, so camX and camY drop
-        // out to a clean (mx-0.5) * vw * realIPD / irisPixelDist —
-        // physically correct in METRES regardless of the assumed HFOV.
-        // Only camZ depends on the HFOV guess, so userScale corrects
-        // depth alone, not lateral.
-        const camX = -((mx - 0.5) * vw) * realIPD / irisPixelDist;
-        const camY = -((my - 0.5) * vh) * realIPD / irisPixelDist;
-        const camZ = depth;
+          const wx = camX;
+          const wy = screen.heightMeters / 2 + camY;
+          const wz = camZ * userScale;
+          eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
-        // Webcam is assumed to sit directly above the screen at
-        // (0, screen.heightMeters/2, 0) in world space.
-        const wx = camX;
-        const wy = screen.heightMeters / 2 + camY;
-        const wz = camZ * userScale;
+          _fallbackStreak = 0;
+          faceStatusEl.textContent = 'tracking';
+        } else {
+          // -------------------- FALLBACK: iris-distance pinhole --------------------
+          // Reached only when the matrix is missing (older MediaPipe build
+          // or transient detection hiccup). Same math as before; less
+          // robust under head rotation but better than freezing.
+          if (!rIris || !lIris) { faceStatusEl.textContent = 'no iris'; return; }
+          const vw = video.videoWidth, vh = video.videoHeight;
+          const dxPx = (rIris.x - lIris.x) * vw;
+          const dyPx = (rIris.y - lIris.y) * vh;
+          const irisPixelDist = Math.hypot(dxPx, dyPx);
+          if (irisPixelDist < 4) return;
+          const realIPD = 0.063;
+          const assumedFovDeg = 60;
+          const f_px = vw / (2 * Math.tan((assumedFovDeg / 2) * Math.PI / 180));
+          const depth = realIPD * f_px / irisPixelDist;
+          const camX = -((mx - 0.5) * vw) * realIPD / irisPixelDist;
+          const camY = -((my - 0.5) * vh) * realIPD / irisPixelDist;
+          const wx = camX;
+          const wy = screen.heightMeters / 2 + camY;
+          const wz = depth * userScale;
+          eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
-        eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
+          _fallbackStreak++;
+          faceStatusEl.textContent = _fallbackStreak > 30 ? 'tracking (iris fallback)' : 'tracking';
+        }
 
         // Preview dot on the (mirrored) webcam preview.
         // Preview is 180x135; dot is 8x8 so subtract 4 to center.
