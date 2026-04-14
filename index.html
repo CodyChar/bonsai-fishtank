@@ -141,7 +141,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 box diorama 6" deep</div>
+    <div id="build-stamp">Build 2026-04-14 box fix (TDZ)</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -165,6 +165,22 @@
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
       const scene = new THREE.Scene();
+
+      // -------------------- Screen geometry (declared early) --------------------
+      // Defined here because rebuildWindowBox() further below references
+      // it during initial scene construction. Originally lived next to
+      // the off-axis projection block; the only thing that lived there
+      // was its functionality, not its declaration.
+      const screen = {
+        widthMeters: 0.355,
+        get heightMeters() {
+          const aspect = window.innerHeight / window.innerWidth;
+          return this.widthMeters * aspect;
+        },
+        pa() { return new THREE.Vector3(-this.widthMeters / 2, -this.heightMeters / 2, 0); },
+        pb() { return new THREE.Vector3( this.widthMeters / 2, -this.heightMeters / 2, 0); },
+        pc() { return new THREE.Vector3(-this.widthMeters / 2,  this.heightMeters / 2, 0); },
+      };
 
       // Procedural sky gradient — a vertex-coloured inverted icosahedron
       // sitting at world distance ~5 m. Cheaper than a CubeRenderTarget
@@ -642,22 +658,6 @@
         undefined,
         (err) => console.warn('[bonsai] usdz load failed — using primitive fallback', err)
       );
-
-      // -------------------- Screen geometry --------------------
-      // Screen plane sits at world z=0. Tree is behind it at negative z.
-      // Screen width is a real physical size the user enters so the parallax
-      // feels correct. Height is derived from the canvas aspect ratio.
-      const screen = {
-        widthMeters: 0.355,    // 14" — the user's actual browser window width
-        get heightMeters() {
-          const aspect = window.innerHeight / window.innerWidth;
-          return this.widthMeters * aspect;
-        },
-        // Corner positions in world space (z=0):
-        pa() { return new THREE.Vector3(-this.widthMeters / 2, -this.heightMeters / 2, 0); }, // lower-left
-        pb() { return new THREE.Vector3( this.widthMeters / 2, -this.heightMeters / 2, 0); }, // lower-right
-        pc() { return new THREE.Vector3(-this.widthMeters / 2,  this.heightMeters / 2, 0); }, // upper-left
-      };
 
       // -------------------- Off-axis projection (Kooima 2009) --------------------
       const _vr = new THREE.Vector3(), _vu = new THREE.Vector3(), _vn = new THREE.Vector3();
