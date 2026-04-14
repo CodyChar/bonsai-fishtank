@@ -104,6 +104,21 @@
         <input id="cam-p" type="range" min="-45" max="45" step="1" value="0">
         <code id="cam-p-val">0°</code>
       </div>
+      <div class="slider-row">
+        <span>Scene X</span>
+        <input id="scene-x" type="range" min="-0.5" max="0.5" step="0.01" value="0">
+        <code id="scene-x-val">0.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Scene Y</span>
+        <input id="scene-y" type="range" min="-0.5" max="0.5" step="0.01" value="0">
+        <code id="scene-y-val">0.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Scene Z</span>
+        <input id="scene-z" type="range" min="-1.0" max="0.2" step="0.01" value="-0.25">
+        <code id="scene-z-val">-0.25</code>
+      </div>
     </div>
 
     <div id="preview">
@@ -111,7 +126,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 meshy fix + dimmed</div>
+    <div id="build-stamp">Build 2026-04-14 scene xyz sliders</div>
 
     <script type="module">
       import * as THREE from 'three';
@@ -762,6 +777,26 @@
         camPVal.textContent = `${camPitchDeg | 0}°`;
         diorama.rotation.x = THREE.MathUtils.degToRad(camPitchDeg);
       });
+
+      // Scene X/Y/Z sliders move the diorama group as a whole — same
+      // pivot as Cam Pitch, so framing controls are coherent. Z range
+      // straddles the screen plane (z=0): negative = behind the window,
+      // positive = poking out toward the viewer.
+      const sceneAxes = [
+        { axis: 'x', input: 'scene-x', val: 'scene-x-val', initial: 0 },
+        { axis: 'y', input: 'scene-y', val: 'scene-y-val', initial: 0 },
+        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.25 },
+      ];
+      for (const cfg of sceneAxes) {
+        diorama.position[cfg.axis] = cfg.initial;
+        const el = document.getElementById(cfg.input);
+        const valEl = document.getElementById(cfg.val);
+        el.addEventListener('input', () => {
+          const v = parseFloat(el.value);
+          diorama.position[cfg.axis] = v;
+          valEl.textContent = v.toFixed(2);
+        });
+      }
 
       // -------------------- Post-processing --------------------
       // EffectComposer pipeline so future effects (DOF, SSR, vignette) can
