@@ -283,7 +283,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 meshy ascii + hand phone</div>
+    <div id="build-stamp">Build 2026-04-14 glb bonsai</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -304,7 +304,7 @@
 
     <script type="module">
       import * as THREE from 'three';
-      import { USDZLoader } from 'three/addons/loaders/USDZLoader.js';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
       import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
       import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
       import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -831,26 +831,20 @@
         parent.add(canopy3);
       }
 
-      // Load the bonsai USDZ.
-      //
-      // The upstream Meshy file ships as USDC (binary USD) inside the
-      // USDZ. three.js 0.160 USDZLoader only parses USDA (ASCII). We
-      // pre-converted the USDC → USDA using Pixar's `usdcat` and
-      // re-packaged with deflate compression so the result stays ~18 MB
-      // instead of ballooning to ~80 MB. JSZip (used by USDZLoader)
-      // accepts compressed USDZ even though the spec recommends STORE.
-      //
-      // The mesh is ~750k triangles (Meshy's default output is dense).
-      // Parsing takes a couple of seconds on first load — that's OK but
-      // we log progress so it doesn't feel dead.
-      console.info('[bonsai] starting USDZ fetch (~18 MB, ASCII-compressed)…');
-      const usdzT0 = performance.now();
-      new USDZLoader().load(
-        './bonsai-meshy.usdz',
-        (usdz) => {
-          const parseMs = (performance.now() - usdzT0).toFixed(0);
+      // Load the bonsai GLB. GLTFLoader is the most battle-tested loader
+      // in three.js; GLB (binary glTF) handles embedded textures,
+      // PBR materials, and efficient indexed geometry out of the box.
+      // We switched from USDZ because three.js 0.160's USDZLoader only
+      // parses USDA (ASCII) and Meshy's USDZ exports are USDC (binary).
+      console.info('[bonsai] starting GLB fetch…');
+      const glbT0 = performance.now();
+      new GLTFLoader().load(
+        './bonsai-meshy.glb',
+        (gltf) => {
+          const parseMs = (performance.now() - glbT0).toFixed(0);
+          const root = gltf.scene;
           let meshCount = 0, totalVerts = 0;
-          usdz.traverse(o => {
+          root.traverse(o => {
             if (o.isMesh) {
               meshCount++;
               const pos = o.geometry?.attributes?.position;
@@ -860,40 +854,38 @@
               o.frustumCulled = false;
             }
           });
-          console.info(`[bonsai] USDZ parsed in ${parseMs} ms — ${meshCount} mesh(es), ${totalVerts} verts`);
-
+          console.info(`[bonsai] GLB parsed in ${parseMs} ms — ${meshCount} mesh(es), ${totalVerts} verts`);
           if (meshCount === 0) {
-            console.warn('[bonsai] USDZ produced no meshes — keeping primitive fallback');
+            console.warn('[bonsai] GLB produced no meshes — keeping primitive fallback');
             return;
           }
 
-          const box = new THREE.Box3().setFromObject(usdz);
+          // Normalize to ~0.3 m longest-edge bounding box and re-center.
+          const box = new THREE.Box3().setFromObject(root);
           const size = box.getSize(new THREE.Vector3());
           const longest = Math.max(size.x, size.y, size.z);
           console.info('[bonsai] bbox size', size.x.toFixed(3), size.y.toFixed(3), size.z.toFixed(3));
-          if (!isFinite(longest) || longest <= 1e-6) {
-            // Mesh data exists but bbox is degenerate — add it anyway at
-            // a default scale so at least SOMETHING renders.
-            usdz.scale.setScalar(0.3);
-          } else {
+          if (isFinite(longest) && longest > 1e-6) {
             const s = 0.3 / longest;
-            usdz.scale.setScalar(s);
-            const rebox = new THREE.Box3().setFromObject(usdz);
+            root.scale.setScalar(s);
+            const rebox = new THREE.Box3().setFromObject(root);
             const c = rebox.getCenter(new THREE.Vector3());
-            usdz.position.sub(c);
+            root.position.sub(c);
+          } else {
+            root.scale.setScalar(0.3);
           }
 
           bonsaiGroup.clear();
-          bonsaiGroup.add(usdz);
+          bonsaiGroup.add(root);
           console.info('[bonsai] added to scene');
         },
         (ev) => {
           if (ev.lengthComputable) {
             const pct = (ev.loaded / ev.total * 100).toFixed(0);
-            console.debug(`[bonsai] usdz download ${pct}%`);
+            console.debug(`[bonsai] glb download ${pct}%`);
           }
         },
-        (err) => console.warn('[bonsai] usdz load failed — using primitive fallback', err)
+        (err) => console.warn('[bonsai] glb load failed — using primitive fallback', err)
       );
 
       // -------------------- Off-axis projection (Kooima 2009) --------------------
