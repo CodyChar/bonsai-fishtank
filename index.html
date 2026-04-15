@@ -208,8 +208,8 @@
       </div>
       <div class="slider-row">
         <span>Scale</span>
-        <input id="scale" type="range" min="0.2" max="4" step="0.05" value="1">
-        <code id="scale-val">1.00</code>
+        <input id="scale" type="range" min="0.2" max="4" step="0.05" value="1.39">
+        <code id="scale-val">1.39</code>
       </div>
       <div class="slider-row">
         <span>Screen W (cm)</span>
@@ -243,13 +243,33 @@
       </div>
       <div class="slider-row">
         <span>Scene Z</span>
-        <input id="scene-z" type="range" min="-1.0" max="1.0" step="0.01" value="-0.08">
-        <code id="scene-z-val">-0.08</code>
+        <input id="scene-z" type="range" min="-1.0" max="1.0" step="0.01" value="0.12">
+        <code id="scene-z-val">0.12</code>
       </div>
       <div class="slider-row">
         <span>Scene scale</span>
-        <input id="scene-s" type="range" min="0.1" max="5" step="0.05" value="0.35">
-        <code id="scene-s-val">0.35</code>
+        <input id="scene-s" type="range" min="0.1" max="5" step="0.05" value="0.25">
+        <code id="scene-s-val">0.25</code>
+      </div>
+      <div class="slider-row">
+        <span>Tree scale</span>
+        <input id="tree-s" type="range" min="0.1" max="5" step="0.05" value="1.00">
+        <code id="tree-s-val">1.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Particle scale</span>
+        <input id="part-s" type="range" min="0.1" max="5" step="0.05" value="1.00">
+        <code id="part-s-val">1.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Particle size</span>
+        <input id="part-size" type="range" min="0.2" max="4" step="0.05" value="1.00">
+        <code id="part-size-val">1.00</code>
+      </div>
+      <div class="slider-row">
+        <span>Letterbox</span>
+        <input id="letterbox" type="range" min="0" max="0.35" step="0.005" value="0.10">
+        <code id="letterbox-val">0.10</code>
       </div>
       <div class="slider-row">
         <span>Box depth (cm)</span>
@@ -263,7 +283,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 phone tracker v2</div>
+    <div id="build-stamp">Build 2026-04-14 splits + letterbox + hybrid phone</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -469,10 +489,12 @@
         blending: THREE.AdditiveBlending,
         uniforms: {
           uTime: { value: 0 },
-          uSunDir: { value: sunDir }
+          uSunDir: { value: sunDir },
+          uSize: { value: 1.0 }
         },
         vertexShader: `
           uniform float uTime;
+          uniform float uSize;
           attribute float aPhase;
           varying vec2 vUv;
           varying vec3 vViewDir;
@@ -485,7 +507,7 @@
             vec4 world = modelMatrix * mv;
             vViewDir = normalize(cameraPosition - world.xyz);
             vec4 mvPos = viewMatrix * world;
-            mvPos.xy += position.xy;
+            mvPos.xy += position.xy * uSize;
             gl_Position = projectionMatrix * mvPos;
           }`,
         fragmentShader: `
@@ -521,12 +543,19 @@
       // Parented to the diorama below so motes float behind the window plane.
 
       // The diorama is parented to a single group so we can shove the
-      // whole thing behind the screen plane in one go. Anything inside
-      // sits ~8 cm "into" the window by default (≈ middle of the box).
+      // whole thing as one unit. Scene X/Y/Z and Scene scale drive this
+      // group. Tree and particle subgroups live inside it with their
+      // own scale sliders so the user can independently tune the bonsai
+      // vs the atmospherics.
       const diorama = new THREE.Group();
-      diorama.position.set(0, 0, -0.08);
-      diorama.scale.setScalar(0.35);
+      diorama.position.set(0, 0, 0.12);     // default: tree poking forward of screen
+      diorama.scale.setScalar(0.25);
       scene.add(diorama);
+
+      const treeGroup = new THREE.Group();
+      diorama.add(treeGroup);
+      const particleGroup = new THREE.Group();
+      diorama.add(particleGroup);
 
       // -------------------- Window box (shoebox diorama) --------------------
       // An inverted BoxGeometry — the camera sits in front of the open
@@ -562,6 +591,37 @@
       }
       rebuildWindowBox();
 
+      // -------------------- Letterbox bars --------------------
+      // Two black rectangles at top + bottom of the screen rectangle,
+      // positioned just behind the screen plane (z = -0.001). Anything
+      // at z < 0 (inside the box) is occluded where the bars overlap;
+      // anything at z > 0 (the bonsai by default, Scene Z = 0.12)
+      // renders OVER them — the "out of bounds" effect: forward
+      // content visually breaks the letterbox frame.
+      const letterboxMat = new THREE.MeshBasicMaterial({
+        color: 0x000000, side: THREE.DoubleSide, fog: false
+      });
+      let letterboxFrac = 0.10;
+      let letterboxTop = null, letterboxBottom = null;
+      function rebuildLetterbox() {
+        [letterboxTop, letterboxBottom].forEach(m => {
+          if (m) { scene.remove(m); m.geometry.dispose(); }
+        });
+        letterboxTop = letterboxBottom = null;
+        if (letterboxFrac <= 0) return;
+        const w = screen.widthMeters;
+        const h = screen.heightMeters;
+        const barH = h * letterboxFrac;
+        const g = new THREE.PlaneGeometry(w, barH);
+        letterboxTop = new THREE.Mesh(g, letterboxMat);
+        letterboxTop.position.set(0, h / 2 - barH / 2, -0.001);
+        scene.add(letterboxTop);
+        letterboxBottom = new THREE.Mesh(g.clone(), letterboxMat);
+        letterboxBottom.position.set(0, -h / 2 + barH / 2, -0.001);
+        scene.add(letterboxBottom);
+      }
+      rebuildLetterbox();
+
       // Ground / pedestal — the "floor of the fishtank"
       const pedestal = new THREE.Mesh(
         new THREE.CylinderGeometry(0.18, 0.2, 0.04, 48),
@@ -570,14 +630,14 @@
       pedestal.position.y = -0.18;
       pedestal.receiveShadow = true;
       pedestal.castShadow = true;
-      diorama.add(pedestal);
+      treeGroup.add(pedestal);
 
       // (The huge circle floor was removed — the box bottom is now the
       // floor of the world.)
 
       // Bonsai placeholder — swapped out when ./bonsai.usdz loads.
       const bonsaiGroup = new THREE.Group();
-      diorama.add(bonsaiGroup);
+      treeGroup.add(bonsaiGroup);
       buildPrimitiveBonsai(bonsaiGroup);
 
       // -------------------- Props --------------------
@@ -589,7 +649,7 @@
       moss.scale.set(1, 0.18, 1);
       moss.position.y = -0.155;
       moss.receiveShadow = true;
-      diorama.add(moss);
+      treeGroup.add(moss);
 
       // Scattered rocks — a fixed seed pattern so the layout is stable
       // between reloads. Slight color variance keeps them from looking
@@ -621,7 +681,7 @@
         rock.rotation.set(rng() * Math.PI, rng() * Math.PI, rng() * Math.PI);
         rock.castShadow = true;
         rock.receiveShadow = true;
-        diorama.add(rock);
+        treeGroup.add(rock);
       }
 
       // A small ceramic dish under the bonsai — sits between the moss
@@ -634,7 +694,7 @@
       dish.position.y = -0.158;
       dish.castShadow = true;
       dish.receiveShadow = true;
-      diorama.add(dish);
+      treeGroup.add(dish);
 
       // -------------------- Drifting petals --------------------
       // Cherry-blossom-coloured instanced quads with a fall + sway
@@ -650,9 +710,10 @@
         transparent: true,
         depthWrite: false,
         side: THREE.DoubleSide,
-        uniforms: { uTime: { value: 0 } },
+        uniforms: { uTime: { value: 0 }, uSize: { value: 1.0 } },
         vertexShader: `
           uniform float uTime;
+          uniform float uSize;
           attribute float aSeed;
           varying vec2 vUv;
           varying float vTilt;
@@ -673,7 +734,7 @@
               0.0, 1.0, 0.0,
               -sin(ang), 0.0, cos(ang)
             );
-            vec3 pos = tilt * vec3(position.x, position.y, 0.0);
+            vec3 pos = tilt * vec3(position.x * uSize, position.y * uSize, 0.0);
             vTilt = tilt[0].z;
 
             vec4 mv = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
@@ -707,11 +768,9 @@
         }
         petalMesh.instanceMatrix.needsUpdate = true;
       }
-      diorama.add(petalMesh);
-
-      // Now that the diorama exists, drop the atmospheric layers in.
-      diorama.add(shaftMesh);
-      diorama.add(dustMesh);
+      particleGroup.add(petalMesh);
+      particleGroup.add(shaftMesh);
+      particleGroup.add(dustMesh);
 
       function buildPrimitiveBonsai(parent) {
         parent.clear();
@@ -866,7 +925,7 @@
       // MediaPipe facial-transformation matrix translation is in cm for the
       // canonical metric face model, so 0.01 is the theoretical scale — but
       // webcam calibration varies wildly. A slider lets the user tune.
-      let userScale = 1.0;
+      let userScale = 1.39;
 
       // Position of the webcam in our world coords, defaulting to "directly
       // above the canvas top, in the screen plane". Corner calibration
@@ -1078,6 +1137,30 @@
         if (video.currentTime === lastVideoTime) return;
         lastVideoTime = video.currentTime;
         const now = performance.now();
+
+        // Phone mode ALSO runs the face landmarker — the user's face
+        // depth gives us a reliable reference (the bbox-size estimate
+        // for phones is noisy and incorrect when the phone is tilted or
+        // partially occluded). We assume the phone is held about one
+        // foot closer to the screen than the user's face, and use the
+        // phone bbox only for LATERAL position. Face landmarker uses
+        // its own timestamp stream (offset by 0.5 ms) so MediaPipe
+        // doesn't complain about non-monotonic ordering.
+        let facePhoneZ = null;           // eye.z (= phone.z + 1 foot) in world
+        let faceCamX = 0, faceCamY = 0;  // fallback lateral if phone missing
+        if (faceLandmarker) {
+          const faceResult = faceLandmarker.detectForVideo(video, now - 0.5);
+          const xform = faceResult.facialTransformationMatrixes?.[0];
+          if (xform) {
+            const m = xform.data;
+            const u = Math.abs(m[14]) > 5 ? 0.01 : 1.0;
+            const camZ_face = Math.abs(m[14]) * u;
+            facePhoneZ = Math.max(0.10, camZ_face - 0.3048);  // 1 foot = 0.3048 m
+            faceCamX = -m[12] * u;
+            faceCamY =  m[13] * u;
+          }
+        }
+
         const result = objectDetector.detectForVideo(video, now);
 
         // Pick the LARGEST detection (rejects background phones lying on
@@ -1094,7 +1177,19 @@
         if (!bestDet) {
           _phoneSmooth.framesSinceDetect++;
           if (now - _phoneSmooth.lastDetectMs > HOLD_MS) {
-            faceStatusEl.textContent = 'no phone';
+            // Bbox is dead. Fall back to face position as the phone
+            // anchor: user's face + 1-foot forward offset. This gives
+            // a usable parallax even if the phone is fully occluded or
+            // out of frame.
+            if (facePhoneZ !== null) {
+              const wx = webcamWorldPos.x + faceCamX;
+              const wy = webcamWorldPos.y + faceCamY;
+              const wz = webcamWorldPos.z + facePhoneZ * userScale;
+              eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
+              faceStatusEl.textContent = 'phone (face-anchor)';
+            } else {
+              faceStatusEl.textContent = 'no phone / no face';
+            }
             return;
           }
           // Still in hold window — fall through using the smoothed state
@@ -1130,7 +1225,14 @@
 
         const phoneLongPx = Math.max(sw, sh);
         if (phoneLongPx < 30) return;
-        const depth = REAL_PHONE_HEIGHT * f_px / phoneLongPx;
+        // Prefer the face-anchored depth when we have a face lock; fall
+        // back to the bbox-size pinhole estimate only if face failed.
+        // The face anchor is MUCH more reliable — phones get wildly
+        // different apparent sizes depending on angle and orientation,
+        // while face depth stays stable under head rotation.
+        const depth = facePhoneZ !== null
+          ? facePhoneZ
+          : REAL_PHONE_HEIGHT * f_px / phoneLongPx;
 
         // Lens position — iPhone Pro (the reference image) places the
         // rear camera in the UPPER-LEFT of the back when held in
@@ -1457,6 +1559,7 @@
           screenWVal.textContent = cm.toFixed(1);
         }
         rebuildWindowBox();
+        rebuildLetterbox();
 
         try {
           localStorage.setItem('bonsaiFishtankCal', JSON.stringify({
@@ -1650,6 +1753,7 @@
         screen.widthMeters = parseFloat(screenWInput.value) / 100;
         screenWVal.textContent = screenWInput.value;
         rebuildWindowBox();
+        rebuildLetterbox();
       });
 
       const boxDInput = document.getElementById('box-d');
@@ -1702,7 +1806,7 @@
       const sceneAxes = [
         { axis: 'x', input: 'scene-x', val: 'scene-x-val', initial: 0 },
         { axis: 'y', input: 'scene-y', val: 'scene-y-val', initial: 0 },
-        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.08 },
+        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: 0.12 },
       ];
       for (const cfg of sceneAxes) {
         diorama.position[cfg.axis] = cfg.initial;
@@ -1721,6 +1825,46 @@
         const v = parseFloat(sceneSInput.value);
         diorama.scale.setScalar(v);
         sceneSVal.textContent = v.toFixed(2);
+      });
+
+      // Tree-only scale (multiplies on top of Scene scale)
+      const treeSInput = document.getElementById('tree-s');
+      const treeSVal = document.getElementById('tree-s-val');
+      treeSInput.addEventListener('input', () => {
+        const v = parseFloat(treeSInput.value);
+        treeGroup.scale.setScalar(v);
+        treeSVal.textContent = v.toFixed(2);
+      });
+
+      // Particle-only scale (positions + sizes of particle instances)
+      const partSInput = document.getElementById('part-s');
+      const partSVal = document.getElementById('part-s-val');
+      partSInput.addEventListener('input', () => {
+        const v = parseFloat(partSInput.value);
+        particleGroup.scale.setScalar(v);
+        partSVal.textContent = v.toFixed(2);
+      });
+
+      // Particle *size* — shader uniform on petal + dust so quad sizes
+      // change without touching the instance matrices. Independent of
+      // the particle-field scale above (which changes positions + sizes
+      // together). This just rescales the quads.
+      const partSizeInput = document.getElementById('part-size');
+      const partSizeVal = document.getElementById('part-size-val');
+      partSizeInput.addEventListener('input', () => {
+        const v = parseFloat(partSizeInput.value);
+        petalMat.uniforms.uSize.value = v;
+        dustMat.uniforms.uSize.value = v;
+        partSizeVal.textContent = v.toFixed(2);
+      });
+
+      // Letterbox height (fraction of canvas height per bar)
+      const letterboxInput = document.getElementById('letterbox');
+      const letterboxValEl = document.getElementById('letterbox-val');
+      letterboxInput.addEventListener('input', () => {
+        letterboxFrac = parseFloat(letterboxInput.value);
+        letterboxValEl.textContent = letterboxFrac.toFixed(2);
+        rebuildLetterbox();
       });
 
       // -------------------- Post-processing --------------------
@@ -1747,6 +1891,7 @@
         canvas.width = w * renderer.getPixelRatio();
         canvas.height = h * renderer.getPixelRatio();
         rebuildWindowBox(); // screen.heightMeters depends on aspect
+        rebuildLetterbox();
       }
       window.addEventListener('resize', resize);
       resize();
