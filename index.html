@@ -283,7 +283,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 glb bonsai</div>
+    <div id="build-stamp">Build 2026-04-14 TDZ fix</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -581,6 +581,12 @@
         side: THREE.BackSide
       });
       let boxDepth = 0.21;        // back wall at z = -boxDepth
+      // letterboxFrac has to be declared BEFORE rebuildWindowBox() runs —
+      // the box height shrinks by the letterbox amount. Hoisting a `let`
+      // and poking it via `typeof` throws a ReferenceError from the TDZ
+      // (unlike `var`), so the variable lives here even though its
+      // slider + rebuild function live further down.
+      let letterboxFrac = 0.10;
       let windowBox = null;
       function rebuildWindowBox() {
         if (windowBox) {
@@ -593,7 +599,7 @@
         // so the ceiling and floor of the 3D box land EXACTLY where the
         // letterbox bars begin. Front-face corners sit at the inner edge
         // of the letterbox frame.
-        const innerH = h * (1 - 2 * (typeof letterboxFrac !== 'undefined' ? letterboxFrac : 0));
+        const innerH = h * (1 - 2 * letterboxFrac);
         const g = new THREE.BoxGeometry(w, innerH, boxDepth);
         windowBox = new THREE.Mesh(g, boxMat);
         // HARD-PIN: front face at z=0 with corners at (±w/2, ±h/2, 0) —
@@ -620,7 +626,6 @@
       const letterboxMat = new THREE.MeshBasicMaterial({
         color: 0x000000, side: THREE.DoubleSide, fog: false
       });
-      let letterboxFrac = 0.10;
       let letterboxTop = null, letterboxBottom = null;
       function rebuildLetterbox() {
         [letterboxTop, letterboxBottom].forEach(m => {
