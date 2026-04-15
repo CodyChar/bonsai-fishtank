@@ -283,7 +283,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 skylight + box-letterbox align</div>
+    <div id="build-stamp">Build 2026-04-14 meshy ascii + hand phone</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -831,56 +831,68 @@
         parent.add(canopy3);
       }
 
-      // Load the bonsai USDZ. three.js's USDZLoader handles the Meshy-
-      // authored UsdPreviewSurface path; complex MaterialX graphs would
-      // need GLB instead.
+      // Load the bonsai USDZ.
+      //
+      // The upstream Meshy file ships as USDC (binary USD) inside the
+      // USDZ. three.js 0.160 USDZLoader only parses USDA (ASCII). We
+      // pre-converted the USDC → USDA using Pixar's `usdcat` and
+      // re-packaged with deflate compression so the result stays ~18 MB
+      // instead of ballooning to ~80 MB. JSZip (used by USDZLoader)
+      // accepts compressed USDZ even though the spec recommends STORE.
+      //
+      // The mesh is ~750k triangles (Meshy's default output is dense).
+      // Parsing takes a couple of seconds on first load — that's OK but
+      // we log progress so it doesn't feel dead.
+      console.info('[bonsai] starting USDZ fetch (~18 MB, ASCII-compressed)…');
+      const usdzT0 = performance.now();
       new USDZLoader().load(
         './bonsai-meshy.usdz',
         (usdz) => {
-          // Compute bbox BEFORE adding to the scene so the parent
-          // group's transform doesn't pollute the measurement.
+          const parseMs = (performance.now() - usdzT0).toFixed(0);
+          let meshCount = 0, totalVerts = 0;
+          usdz.traverse(o => {
+            if (o.isMesh) {
+              meshCount++;
+              const pos = o.geometry?.attributes?.position;
+              if (pos) totalVerts += pos.count;
+              o.castShadow = true;
+              o.receiveShadow = true;
+              o.frustumCulled = false;
+            }
+          });
+          console.info(`[bonsai] USDZ parsed in ${parseMs} ms — ${meshCount} mesh(es), ${totalVerts} verts`);
+
+          if (meshCount === 0) {
+            console.warn('[bonsai] USDZ produced no meshes — keeping primitive fallback');
+            return;
+          }
+
           const box = new THREE.Box3().setFromObject(usdz);
           const size = box.getSize(new THREE.Vector3());
           const longest = Math.max(size.x, size.y, size.z);
-          if (!isFinite(longest) || longest <= 0) {
-            console.warn('[bonsai] usdz has empty bbox — keeping primitive fallback', size);
-            return;
+          console.info('[bonsai] bbox size', size.x.toFixed(3), size.y.toFixed(3), size.z.toFixed(3));
+          if (!isFinite(longest) || longest <= 1e-6) {
+            // Mesh data exists but bbox is degenerate — add it anyway at
+            // a default scale so at least SOMETHING renders.
+            usdz.scale.setScalar(0.3);
+          } else {
+            const s = 0.3 / longest;
+            usdz.scale.setScalar(s);
+            const rebox = new THREE.Box3().setFromObject(usdz);
+            const c = rebox.getCenter(new THREE.Vector3());
+            usdz.position.sub(c);
           }
-          const scale = 0.3 / longest;
-          usdz.scale.setScalar(scale);
-          // Recentre using the *scaled* box so the pivot lands on the
-          // tree, not in empty space.
-          const rebox = new THREE.Box3().setFromObject(usdz);
-          const c = rebox.getCenter(new THREE.Vector3());
-          usdz.position.sub(c);
-
-          // Defensive material fixes: Meshy assets sometimes ship with
-          // single-sided geometry, transparent flags on opaque materials,
-          // or alphaTest values that wipe out the canopy. Normalise so
-          // the tree is guaranteed visible.
-          usdz.traverse(o => {
-            if (!o.isMesh) return;
-            o.castShadow = true;
-            o.receiveShadow = true;
-            o.frustumCulled = false; // bbox occasionally lies on USDZ
-            const mats = Array.isArray(o.material) ? o.material : [o.material];
-            for (const m of mats) {
-              if (!m) continue;
-              m.side = THREE.DoubleSide;
-              if (m.transparent && (m.opacity === undefined || m.opacity > 0.99)) {
-                m.transparent = false;
-                m.depthWrite = true;
-              }
-              if (m.alphaTest > 0.5) m.alphaTest = 0.1;
-              m.needsUpdate = true;
-            }
-          });
-          console.info('[bonsai] usdz loaded, bbox', size, 'scale', scale);
 
           bonsaiGroup.clear();
           bonsaiGroup.add(usdz);
+          console.info('[bonsai] added to scene');
         },
-        undefined,
+        (ev) => {
+          if (ev.lengthComputable) {
+            const pct = (ev.loaded / ev.total * 100).toFixed(0);
+            console.debug(`[bonsai] usdz download ${pct}%`);
+          }
+        },
         (err) => console.warn('[bonsai] usdz load failed — using primitive fallback', err)
       );
 
@@ -1152,21 +1164,24 @@
       let _fallbackStreak = 0;
 
       function tickPhone() {
-        if (!objectDetector || video.readyState < 2) return;
+        if (video.readyState < 2) return;
         if (video.currentTime === lastVideoTime) return;
         lastVideoTime = video.currentTime;
         const now = performance.now();
 
-        // Phone mode ALSO runs the face landmarker — the user's face
-        // depth gives us a reliable reference (the bbox-size estimate
-        // for phones is noisy and incorrect when the phone is tilted or
-        // partially occluded). We assume the phone is held about one
-        // foot closer to the screen than the user's face, and use the
-        // phone bbox only for LATERAL position. Face landmarker uses
-        // its own timestamp stream (offset by 0.5 ms) so MediaPipe
-        // doesn't complain about non-monotonic ordering.
-        let facePhoneZ = null;           // eye.z (= phone.z + 1 foot) in world
-        let faceCamX = 0, faceCamY = 0;  // fallback lateral if phone missing
+        // Phone mode runs FACE + HAND landmarkers, not the heavy object
+        // detector. Rationale (user spec):
+        //   • The phone is assumed to sit ~1 foot closer to the screen
+        //     than the user's face → face gives rock-solid depth.
+        //   • The user holds the phone with one hand → hand-landmarker's
+        //     wrist + fingertip landmarks give a precise, low-latency
+        //     2D position for where the phone body is.
+        //   • The phone's LENS sits slightly above the wrist (how most
+        //     people hold a phone sideways for video), so we offset up.
+        // Both models use distinct timestamp streams so MediaPipe's
+        // monotonic check passes.
+        let facePhoneZ = null;
+        let faceCamX = 0, faceCamY = 0;
         if (faceLandmarker) {
           const faceResult = faceLandmarker.detectForVideo(video, now - 0.5);
           const xform = faceResult.facialTransformationMatrixes?.[0];
@@ -1174,103 +1189,78 @@
             const m = xform.data;
             const u = Math.abs(m[14]) > 5 ? 0.01 : 1.0;
             const camZ_face = Math.abs(m[14]) * u;
-            facePhoneZ = Math.max(0.10, camZ_face - 0.3048);  // 1 foot = 0.3048 m
+            facePhoneZ = Math.max(0.10, camZ_face - 0.3048);
             faceCamX = -m[12] * u;
             faceCamY =  m[13] * u;
           }
         }
 
-        const result = objectDetector.detectForVideo(video, now);
-
-        // Pick the LARGEST detection (rejects background phones lying on
-        // a desk while the user holds one in front). Only fall through
-        // to "no phone" if we have nothing detected AND the smoothed
-        // memory is stale.
-        let bestDet = null, bestArea = 0;
-        for (const d of (result.detections || [])) {
-          const a = d.boundingBox.width * d.boundingBox.height;
-          if (a > bestArea) { bestArea = a; bestDet = d; }
+        // Hand-based phone lateral position. If the hand landmarker
+        // isn't loaded yet (first phone-mode tick), trigger the async
+        // load but use face-anchor fallback for this frame.
+        if (!handLandmarker) {
+          ensureHandLandmarker().catch(e =>
+            console.warn('[fishtank] hand model load failed in phone mode', e)
+          );
+        }
+        let handLm = null;
+        if (handLandmarker) {
+          const handResult = handLandmarker.detectForVideo(video, now);
+          handLm = handResult?.landmarks?.[0] || null;
         }
 
-        const HOLD_MS = 600; // keep last bbox alive briefly across detection gaps
-        if (!bestDet) {
-          _phoneSmooth.framesSinceDetect++;
-          if (now - _phoneSmooth.lastDetectMs > HOLD_MS) {
-            // Bbox is dead. Fall back to face position as the phone
-            // anchor: user's face + 1-foot forward offset. This gives
-            // a usable parallax even if the phone is fully occluded or
-            // out of frame.
-            if (facePhoneZ !== null) {
-              const wx = webcamWorldPos.x + faceCamX;
-              const wy = webcamWorldPos.y + faceCamY;
-              const wz = webcamWorldPos.z + facePhoneZ * userScale;
-              eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
-              faceStatusEl.textContent = 'phone (face-anchor)';
-            } else {
-              faceStatusEl.textContent = 'no phone / no face';
-            }
-            return;
-          }
-          // Still in hold window — fall through using the smoothed state
-          // so a 1-3 frame dropout doesn't yank the camera back.
-        } else {
-          _phoneSmooth.framesSinceDetect = 0;
-          _phoneSmooth.lastDetectMs = now;
-          _phoneSmooth.score = bestDet.categories?.[0]?.score ?? 0;
-          const bb = bestDet.boundingBox;
-          const cx = bb.originX + bb.width / 2;
-          const cy = bb.originY + bb.height / 2;
-          // EMA blend — alpha is higher when we have a strong, fresh
-          // detection so we don't lag behind fast moves; lower for
-          // weak detections to suppress jitter.
-          const a = THREE.MathUtils.clamp(0.35 + _phoneSmooth.score * 0.4, 0.25, 0.7);
-          if (_phoneSmooth.cx === null) {
-            _phoneSmooth.cx = cx; _phoneSmooth.cy = cy;
-            _phoneSmooth.w = bb.width; _phoneSmooth.h = bb.height;
+        if (!handLm) {
+          // No hand detected — fall back to face position + 1-foot
+          // offset (phone assumed directly in front of face).
+          if (facePhoneZ !== null) {
+            const wx = webcamWorldPos.x + faceCamX;
+            const wy = webcamWorldPos.y + faceCamY;
+            const wz = webcamWorldPos.z + facePhoneZ * userScale;
+            eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
+            faceStatusEl.textContent = 'phone (face-anchor)';
           } else {
-            _phoneSmooth.cx += (cx - _phoneSmooth.cx) * a;
-            _phoneSmooth.cy += (cy - _phoneSmooth.cy) * a;
-            _phoneSmooth.w += (bb.width - _phoneSmooth.w) * a;
-            _phoneSmooth.h += (bb.height - _phoneSmooth.h) * a;
+            faceStatusEl.textContent = 'no hand / no face';
           }
+          return;
         }
 
-        if (_phoneSmooth.cx === null) return;
-
-        const cx = _phoneSmooth.cx, cy = _phoneSmooth.cy;
-        const sw = _phoneSmooth.w, sh = _phoneSmooth.h;
+        // Hand landmarks:
+        //   0 = wrist, 5 = index MCP, 9 = middle MCP, 13 = ring MCP, 17 = pinky MCP
+        // The "body" of the phone is approximately where the palm sits —
+        // the centroid of the MCP knuckles (5, 9, 13, 17) is a stable
+        // anchor (more stable than the wrist, less noisy than individual
+        // fingertips). The phone LENS is a few cm ABOVE this centroid
+        // when the phone is held in landscape with rear-camera up.
         const vw = video.videoWidth, vh = video.videoHeight;
-        const f_px = vw / (2 * Math.tan((ASSUMED_HFOV_DEG / 2) * Math.PI / 180));
+        let palmX = 0, palmY = 0;
+        for (const idx of [5, 9, 13, 17]) {
+          palmX += handLm[idx].x;
+          palmY += handLm[idx].y;
+        }
+        palmX = (palmX / 4) * vw;
+        palmY = (palmY / 4) * vh;
 
-        const phoneLongPx = Math.max(sw, sh);
-        if (phoneLongPx < 30) return;
-        // Prefer the face-anchored depth when we have a face lock; fall
-        // back to the bbox-size pinhole estimate only if face failed.
-        // The face anchor is MUCH more reliable — phones get wildly
-        // different apparent sizes depending on angle and orientation,
-        // while face depth stays stable under head rotation.
+        // Lens is above the palm in image space. Offset in PIXELS is
+        // proportional to the observed hand size so it scales with
+        // distance. Hand width (pinky MCP → index MCP) serves as that
+        // scale ruler.
+        const dxHand = (handLm[5].x - handLm[17].x) * vw;
+        const dyHand = (handLm[5].y - handLm[17].y) * vh;
+        const handSpanPx = Math.hypot(dxHand, dyHand);
+        // Lens sits about 0.8 × hand-span above the palm centroid
+        // (~4-6 cm in real units for typical adult hands).
+        const LENS_OFFSET_FRAC = 0.8;
+        const lensImgX = palmX;
+        const lensImgY = palmY - handSpanPx * LENS_OFFSET_FRAC;
+
+        // Use face-anchored depth (user spec: phone is 1 foot closer
+        // than face). Fall back to a hand-size-based depth estimate if
+        // face isn't available (rare — would require face occlusion).
         const depth = facePhoneZ !== null
           ? facePhoneZ
-          : REAL_PHONE_HEIGHT * f_px / phoneLongPx;
+          : (0.09 * (vw / (2 * Math.tan((ASSUMED_HFOV_DEG / 2) * Math.PI / 180))) / Math.max(handSpanPx, 20));
 
-        // Lens position — iPhone Pro (the reference image) places the
-        // rear camera in the UPPER-LEFT of the back when held in
-        // portrait. Detect orientation from aspect ratio:
-        //   • portrait (h > w): camera at (left ~22%, top ~14%) of bbox
-        //   • landscape (w > h, rotated 90° CW): camera at (left ~14%, top ~78%)
-        // The webcam mirrors the user (image-left = user-right), so
-        // "left of bbox" needs no extra flip — the same sign-flip we
-        // apply to all X positions handles it.
-        const portrait = sh >= sw;
-        const lensFracX = portrait ? 0.22 : 0.14;
-        const lensFracY = portrait ? 0.14 : 0.78;
-        const lensImgX = cx - sw / 2 + sw * lensFracX;
-        const lensImgY = cy - sh / 2 + sh * lensFracY;
-
-        // Same sign-flip pinhole projection as the face path.
-        // (Y is NOT flipped — we use OpenGL +Y up convention here too,
-        // matching the face-matrix path so phone-mode parallax direction
-        // agrees with face-mode.)
+        const f_px = vw / (2 * Math.tan((ASSUMED_HFOV_DEG / 2) * Math.PI / 180));
         const camX = -((lensImgX - vw / 2)) / f_px * depth;
         const camY =  ((vh / 2 - lensImgY)) / f_px * depth;
         const camZ = depth;
@@ -1280,9 +1270,7 @@
         const wz = webcamWorldPos.z + camZ * userScale;
         eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
-        const ageMs = now - _phoneSmooth.lastDetectMs;
-        const stale = ageMs > 100 ? ` (hold ${Math.round(ageMs)}ms)` : '';
-        faceStatusEl.textContent = `phone ${Math.round(_phoneSmooth.score * 100)}%${stale}`;
+        faceStatusEl.textContent = `phone (hand)`;
       }
 
       function tickFace() {
@@ -1713,9 +1701,11 @@
         modeBtn.textContent = 'Mode: ' + (mode === 'phone' ? 'Phone' : 'Face');
         try { localStorage.setItem('bonsaiTrackingMode', mode); } catch (e) {}
         if (mode === 'phone') {
-          resetPhoneSmoothing();
-          ensureObjectDetector().catch(e => {
-            console.error('[fishtank] object detector load failed', e);
+          // Phone mode is now face + hand based (not object detection)
+          // — hand landmarker is much faster and less jittery than the
+          // EfficientDet phone bbox.
+          ensureHandLandmarker().catch(e => {
+            console.error('[fishtank] hand model load failed', e);
             faceStatusEl.textContent = 'phone model error';
             applyTrackingMode('face');
           });
