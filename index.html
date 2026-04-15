@@ -67,6 +67,37 @@
       .slider-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-top: 6px; }
       .slider-row input { flex: 1; }
 
+      /* -------------------- Hamburger UI toggle -------------------- */
+      /* When body.ui-hidden is set, every chrome element collapses to
+         keep the canvas clean for video recording. Only the hamburger
+         button itself stays visible so the user can bring the UI back. */
+      #hud-toggle {
+        position: fixed; top: 12px; left: 12px; z-index: 50;
+        width: 38px; height: 38px;
+        background: rgba(10,14,22,0.6);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 10px;
+        display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 4px;
+        cursor: pointer; padding: 0;
+        transition: opacity 0.2s, background 0.2s;
+      }
+      #hud-toggle:hover { background: rgba(20,28,44,0.85); }
+      #hud-toggle span {
+        display: block; width: 18px; height: 2px;
+        background: #e8eef5; border-radius: 1px;
+        transition: opacity 0.2s;
+      }
+      body.ui-hidden #hud,
+      body.ui-hidden #preview,
+      body.ui-hidden #build-stamp,
+      body.ui-hidden #cal-finger-marker { display: none !important; }
+      body.ui-hidden #hud-toggle { opacity: 0.25; }
+      body.ui-hidden #hud-toggle:hover { opacity: 1; }
+      /* Push hud below the hamburger so they don't overlap */
+      #hud { top: 60px; }
+
       /* -------------------- Calibration overlay -------------------- */
       #cal-overlay {
         position: fixed; inset: 0; pointer-events: none; z-index: 30;
@@ -157,6 +188,9 @@
   <body>
     <canvas id="canvas"></canvas>
 
+    <button id="hud-toggle" aria-label="Toggle UI" title="Show / hide UI (H)">
+      <span></span><span></span><span></span>
+    </button>
     <div id="hud">
       <h1>Bonsai Fishtank</h1>
       <div class="row"><span>FPS</span><code id="fps">—</code></div>
@@ -166,6 +200,7 @@
         <button id="start-btn" class="btn">Enable Camera</button>
         <button id="calibrate-btn" class="btn secondary" hidden>Recenter</button>
         <button id="corner-cal-btn" class="btn secondary" hidden>Calibrate Corners</button>
+        <button id="mode-btn" class="btn secondary" hidden>Mode: Face</button>
       </div>
       <div class="slider-row" id="camera-picker-row" hidden>
         <span>Camera</span>
@@ -228,7 +263,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 view-matrix fix</div>
+    <div id="build-stamp">Build 2026-04-14 phone mode + hamburger</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -255,7 +290,7 @@
       import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
       import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
       import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-      import { FilesetResolver, FaceLandmarker, HandLandmarker } from
+      import { FilesetResolver, FaceLandmarker, HandLandmarker, ObjectDetector } from
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/vision_bundle.mjs';
 
       // -------------------- Scene --------------------
@@ -909,6 +944,10 @@
         faceStatusEl.textContent = 'tracking';
         document.getElementById('calibrate-btn').hidden = false;
         document.getElementById('corner-cal-btn').hidden = false;
+        document.getElementById('mode-btn').hidden = false;
+        // Apply persisted mode (if user previously chose phone, this will
+        // kick off the object detector load).
+        applyTrackingMode(trackingMode);
         populateCameraPicker();
       }
 
@@ -931,6 +970,37 @@
         console.info('[fishtank] hand landmarker ready');
         return handLandmarker;
       }
+
+      // Lazy-loaded ObjectDetector for phone-tracking mode. Uses
+      // EfficientDet-Lite0 (small/fast) restricted to COCO 'cell phone'
+      // class so the user can record video of the screen with their
+      // phone — the parallax then responds to the phone's lens position
+      // instead of their face. Loaded only when phone mode is engaged.
+      let objectDetector = null;
+      const REAL_PHONE_HEIGHT = 0.155;   // ~6.1" — typical modern phone long edge
+      async function ensureObjectDetector() {
+        if (objectDetector) return objectDetector;
+        if (!visionRef) throw new Error('Camera not started yet');
+        objectDetector = await ObjectDetector.createFromOptions(visionRef, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
+            delegate: 'GPU'
+          },
+          runningMode: 'VIDEO',
+          scoreThreshold: 0.35,
+          categoryAllowlist: ['cell phone'],
+          maxResults: 1
+        });
+        console.info('[fishtank] object detector ready (phone mode)');
+        return objectDetector;
+      }
+
+      // Tracking mode: 'face' uses face landmarker (eye position drives
+      // parallax for a person sitting at the screen), 'phone' uses
+      // object detector to track a phone's lens position so the user
+      // can move the phone around and record clean parallax-driven
+      // video of the screen.
+      let trackingMode = localStorage.getItem('bonsaiTrackingMode') || 'face';
 
       // Once we have permission we can enumerate devices (labels are
       // only exposed after the user granted access). Populate a picker
@@ -976,12 +1046,63 @@
       // based depth — used as a soft hint in the HUD.
       let _fallbackStreak = 0;
 
+      function tickPhone() {
+        if (!objectDetector || video.readyState < 2) return;
+        if (video.currentTime === lastVideoTime) return;
+        lastVideoTime = video.currentTime;
+        const result = objectDetector.detectForVideo(video, performance.now());
+        const det = result.detections?.[0];
+        if (!det) { faceStatusEl.textContent = 'no phone'; return; }
+
+        // boundingBox is in pixel coords of the source video frame.
+        const bb = det.boundingBox;
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const f_px = vw / (2 * Math.tan((ASSUMED_HFOV_DEG / 2) * Math.PI / 180));
+
+        // Depth from the longer bbox edge: assume phone's long axis is
+        // the standard ~15.5 cm, regardless of portrait/landscape hold.
+        const phoneLongPx = Math.max(bb.width, bb.height);
+        if (phoneLongPx < 30) return;
+        const depth = REAL_PHONE_HEIGHT * f_px / phoneLongPx;
+
+        // Lens approximation: most phones have the rear camera near the
+        // top edge of the body. Use the upper-quarter of the bounding
+        // box on whichever dimension is the long edge. For a portrait
+        // hold (height > width) → bias UP. For landscape → bias to one
+        // side; we pick the left edge as a stable default.
+        let lensImgX, lensImgY;
+        if (bb.height >= bb.width) {
+          // portrait
+          lensImgX = bb.originX + bb.width / 2;
+          lensImgY = bb.originY + bb.height * 0.12;
+        } else {
+          // landscape — assume back-camera up, picture-frame right
+          lensImgX = bb.originX + bb.width * 0.12;
+          lensImgY = bb.originY + bb.height / 2;
+        }
+
+        // Same sign-flip pinhole projection as the face path.
+        const camX = -((lensImgX - vw / 2)) / f_px * depth;
+        const camY = -((lensImgY - vh / 2)) / f_px * depth;
+        const camZ = depth;
+
+        const wx = webcamWorldPos.x + camX;
+        const wy = webcamWorldPos.y + camY;
+        const wz = webcamWorldPos.z + camZ * userScale;
+        eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
+
+        const score = det.categories?.[0]?.score ?? 0;
+        faceStatusEl.textContent = `phone ${Math.round(score * 100)}%`;
+      }
+
       function tickFace() {
-        if (!tracking || !faceLandmarker || video.readyState < 2) return;
-        // Pause the regular face detection while a calibration capture is
-        // running — the calibration loop calls the same model with its
-        // own timestamps and MediaPipe rejects non-monotonic ones.
+        if (!tracking || video.readyState < 2) return;
+        // Pause regular trackers while a calibration capture is running —
+        // the calibration loop calls models with its own timestamps and
+        // MediaPipe rejects non-monotonic ones.
         if (calibratingCorners) return;
+        if (trackingMode === 'phone') { tickPhone(); return; }
+        if (!faceLandmarker) return;
         if (video.currentTime === lastVideoTime) return;
         lastVideoTime = video.currentTime;
 
@@ -1386,6 +1507,42 @@
         });
       });
       calCancelBtn.addEventListener('click', () => { calCancelled = true; });
+
+      // -------------------- Tracking mode toggle --------------------
+      const modeBtn = document.getElementById('mode-btn');
+      function applyTrackingMode(mode) {
+        trackingMode = mode;
+        modeBtn.textContent = 'Mode: ' + (mode === 'phone' ? 'Phone' : 'Face');
+        try { localStorage.setItem('bonsaiTrackingMode', mode); } catch (e) {}
+        if (mode === 'phone') {
+          ensureObjectDetector().catch(e => {
+            console.error('[fishtank] object detector load failed', e);
+            faceStatusEl.textContent = 'phone model error';
+            applyTrackingMode('face');
+          });
+        }
+      }
+      modeBtn.addEventListener('click', () => {
+        applyTrackingMode(trackingMode === 'face' ? 'phone' : 'face');
+      });
+
+      // -------------------- Hamburger UI toggle --------------------
+      const hudToggle = document.getElementById('hud-toggle');
+      function setUIHidden(hidden) {
+        document.body.classList.toggle('ui-hidden', hidden);
+        try { localStorage.setItem('bonsaiUIHidden', hidden ? '1' : '0'); } catch (e) {}
+      }
+      hudToggle.addEventListener('click', () => {
+        setUIHidden(!document.body.classList.contains('ui-hidden'));
+      });
+      window.addEventListener('keydown', (ev) => {
+        // 'h' toggles UI; ignore if user is typing in an input
+        if (ev.key === 'h' && !(ev.target instanceof HTMLInputElement)) {
+          setUIHidden(!document.body.classList.contains('ui-hidden'));
+        }
+      });
+      // Restore hidden state on load
+      if (localStorage.getItem('bonsaiUIHidden') === '1') setUIHidden(true);
 
       document.getElementById('start-btn').addEventListener('click', (ev) => {
         ev.currentTarget.disabled = true;
