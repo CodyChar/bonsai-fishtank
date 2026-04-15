@@ -228,7 +228,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 cal targets v2</div>
+    <div id="build-stamp">Build 2026-04-14 view-matrix fix</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -774,6 +774,7 @@
       // -------------------- Off-axis projection (Kooima 2009) --------------------
       const _vr = new THREE.Vector3(), _vu = new THREE.Vector3(), _vn = new THREE.Vector3();
       const _va = new THREE.Vector3(), _vb = new THREE.Vector3(), _vc = new THREE.Vector3();
+      const _camBasis = new THREE.Matrix4();
       function updateOffAxisCamera(eye) {
         const pa = screen.pa(), pb = screen.pb(), pc = screen.pc();
         _vr.copy(pb).sub(pa).normalize();
@@ -796,9 +797,18 @@
         camera.projectionMatrix.makePerspective(l, r, t, b, near, far);
         camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
 
+        // Per Kooima 2009 / Johnny Lee Wii: the view matrix must align
+        // the camera's local axes with the SCREEN basis (right=_vr,
+        // up=_vu, back=_vn), NOT use lookAt(screen-centre). The
+        // off-axis projection matrix above already encodes the
+        // asymmetry from the eye's lateral offset; combining it with a
+        // tilted view (lookAt screen-centre) double-skews the result
+        // and inverts past certain head positions. Three.js cameras
+        // look toward local -Z, so making local +Z = _vn means the
+        // camera looks toward -_vn, i.e. into the screen.
         camera.position.copy(eye);
-        camera.up.set(0, 1, 0);
-        camera.lookAt(0, 0, 0);
+        _camBasis.makeBasis(_vr, _vu, _vn);
+        camera.quaternion.setFromRotationMatrix(_camBasis);
       }
 
       // -------------------- Face tracking --------------------
@@ -1064,7 +1074,7 @@
         // already in real metres so the offsets are just the current
         // raw values — no scale gymnastics.
         const camX = eye.x + calibrationOffset.x;
-        const camY = eye.y - screen.heightMeters / 2 + calibrationOffset.y;
+        const camY = eye.y - webcamWorldPos.y + calibrationOffset.y;
         const camZ = Math.max(0.05, (eye.z + calibrationOffset.z) / userScale);
         userScale = THREE.MathUtils.clamp(targetDepth / camZ, 0.2, 4);
         scaleInput.value = userScale.toFixed(2);
