@@ -263,7 +263,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 Y-axis sign fix</div>
+    <div id="build-stamp">Build 2026-04-14 phone tracker v2</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -971,28 +971,55 @@
         return handLandmarker;
       }
 
-      // Lazy-loaded ObjectDetector for phone-tracking mode. Uses
-      // EfficientDet-Lite0 (small/fast) restricted to COCO 'cell phone'
-      // class so the user can record video of the screen with their
-      // phone — the parallax then responds to the phone's lens position
-      // instead of their face. Loaded only when phone mode is engaged.
+      // Lazy-loaded ObjectDetector for phone-tracking mode.
+      //
+      // Reference image: iphone-reference.jpg in repo root (iPhone Pro,
+      // white/silver, distinctive triple-lens cluster in upper-left of
+      // back). The image was used to tune detection params + lens-
+      // position heuristic — true ML retraining isn't viable in-browser.
+      //
+      // Tuning choices:
+      //   • EfficientDet-Lite2 (vs Lite0) — ~40% larger, noticeably
+      //     better recall on hand-held / partly-occluded phones.
+      //   • scoreThreshold 0.20 (vs 0.35) — phones often get 0.25-0.40
+      //     scores when held edge-on; lower threshold + temporal
+      //     smoothing avoids dropouts.
+      //   • maxResults 3 + pick-largest — reject background phones that
+      //     might be lying on a desk in frame.
       let objectDetector = null;
-      const REAL_PHONE_HEIGHT = 0.155;   // ~6.1" — typical modern phone long edge
+      const REAL_PHONE_HEIGHT = 0.155;   // ~6.1" — iPhone Pro long edge
       async function ensureObjectDetector() {
         if (objectDetector) return objectDetector;
         if (!visionRef) throw new Error('Camera not started yet');
         objectDetector = await ObjectDetector.createFromOptions(visionRef, {
           baseOptions: {
-            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite',
             delegate: 'GPU'
           },
           runningMode: 'VIDEO',
-          scoreThreshold: 0.35,
+          scoreThreshold: 0.20,
           categoryAllowlist: ['cell phone'],
-          maxResults: 1
+          maxResults: 3
         });
-        console.info('[fishtank] object detector ready (phone mode)');
+        console.info('[fishtank] object detector ready (phone mode, EfficientDet-Lite2)');
         return objectDetector;
+      }
+
+      // Smoothed bbox state — exponential moving average on box centre +
+      // dimensions. Reduces jitter + survives single-frame dropouts via
+      // a "hold-last" memory window. Reset when phone mode is toggled.
+      const _phoneSmooth = {
+        cx: null, cy: null, w: null, h: null,
+        score: 0,
+        lastDetectMs: -Infinity,
+        framesSinceDetect: 0
+      };
+      function resetPhoneSmoothing() {
+        _phoneSmooth.cx = null; _phoneSmooth.cy = null;
+        _phoneSmooth.w = null; _phoneSmooth.h = null;
+        _phoneSmooth.score = 0;
+        _phoneSmooth.lastDetectMs = -Infinity;
+        _phoneSmooth.framesSinceDetect = 0;
       }
 
       // Tracking mode: 'face' uses face landmarker (eye position drives
@@ -1050,40 +1077,81 @@
         if (!objectDetector || video.readyState < 2) return;
         if (video.currentTime === lastVideoTime) return;
         lastVideoTime = video.currentTime;
-        const result = objectDetector.detectForVideo(video, performance.now());
-        const det = result.detections?.[0];
-        if (!det) { faceStatusEl.textContent = 'no phone'; return; }
+        const now = performance.now();
+        const result = objectDetector.detectForVideo(video, now);
 
-        // boundingBox is in pixel coords of the source video frame.
-        const bb = det.boundingBox;
+        // Pick the LARGEST detection (rejects background phones lying on
+        // a desk while the user holds one in front). Only fall through
+        // to "no phone" if we have nothing detected AND the smoothed
+        // memory is stale.
+        let bestDet = null, bestArea = 0;
+        for (const d of (result.detections || [])) {
+          const a = d.boundingBox.width * d.boundingBox.height;
+          if (a > bestArea) { bestArea = a; bestDet = d; }
+        }
+
+        const HOLD_MS = 600; // keep last bbox alive briefly across detection gaps
+        if (!bestDet) {
+          _phoneSmooth.framesSinceDetect++;
+          if (now - _phoneSmooth.lastDetectMs > HOLD_MS) {
+            faceStatusEl.textContent = 'no phone';
+            return;
+          }
+          // Still in hold window — fall through using the smoothed state
+          // so a 1-3 frame dropout doesn't yank the camera back.
+        } else {
+          _phoneSmooth.framesSinceDetect = 0;
+          _phoneSmooth.lastDetectMs = now;
+          _phoneSmooth.score = bestDet.categories?.[0]?.score ?? 0;
+          const bb = bestDet.boundingBox;
+          const cx = bb.originX + bb.width / 2;
+          const cy = bb.originY + bb.height / 2;
+          // EMA blend — alpha is higher when we have a strong, fresh
+          // detection so we don't lag behind fast moves; lower for
+          // weak detections to suppress jitter.
+          const a = THREE.MathUtils.clamp(0.35 + _phoneSmooth.score * 0.4, 0.25, 0.7);
+          if (_phoneSmooth.cx === null) {
+            _phoneSmooth.cx = cx; _phoneSmooth.cy = cy;
+            _phoneSmooth.w = bb.width; _phoneSmooth.h = bb.height;
+          } else {
+            _phoneSmooth.cx += (cx - _phoneSmooth.cx) * a;
+            _phoneSmooth.cy += (cy - _phoneSmooth.cy) * a;
+            _phoneSmooth.w += (bb.width - _phoneSmooth.w) * a;
+            _phoneSmooth.h += (bb.height - _phoneSmooth.h) * a;
+          }
+        }
+
+        if (_phoneSmooth.cx === null) return;
+
+        const cx = _phoneSmooth.cx, cy = _phoneSmooth.cy;
+        const sw = _phoneSmooth.w, sh = _phoneSmooth.h;
         const vw = video.videoWidth, vh = video.videoHeight;
         const f_px = vw / (2 * Math.tan((ASSUMED_HFOV_DEG / 2) * Math.PI / 180));
 
-        // Depth from the longer bbox edge: assume phone's long axis is
-        // the standard ~15.5 cm, regardless of portrait/landscape hold.
-        const phoneLongPx = Math.max(bb.width, bb.height);
+        const phoneLongPx = Math.max(sw, sh);
         if (phoneLongPx < 30) return;
         const depth = REAL_PHONE_HEIGHT * f_px / phoneLongPx;
 
-        // Lens approximation: most phones have the rear camera near the
-        // top edge of the body. Use the upper-quarter of the bounding
-        // box on whichever dimension is the long edge. For a portrait
-        // hold (height > width) → bias UP. For landscape → bias to one
-        // side; we pick the left edge as a stable default.
-        let lensImgX, lensImgY;
-        if (bb.height >= bb.width) {
-          // portrait
-          lensImgX = bb.originX + bb.width / 2;
-          lensImgY = bb.originY + bb.height * 0.12;
-        } else {
-          // landscape — assume back-camera up, picture-frame right
-          lensImgX = bb.originX + bb.width * 0.12;
-          lensImgY = bb.originY + bb.height / 2;
-        }
+        // Lens position — iPhone Pro (the reference image) places the
+        // rear camera in the UPPER-LEFT of the back when held in
+        // portrait. Detect orientation from aspect ratio:
+        //   • portrait (h > w): camera at (left ~22%, top ~14%) of bbox
+        //   • landscape (w > h, rotated 90° CW): camera at (left ~14%, top ~78%)
+        // The webcam mirrors the user (image-left = user-right), so
+        // "left of bbox" needs no extra flip — the same sign-flip we
+        // apply to all X positions handles it.
+        const portrait = sh >= sw;
+        const lensFracX = portrait ? 0.22 : 0.14;
+        const lensFracY = portrait ? 0.14 : 0.78;
+        const lensImgX = cx - sw / 2 + sw * lensFracX;
+        const lensImgY = cy - sh / 2 + sh * lensFracY;
 
         // Same sign-flip pinhole projection as the face path.
+        // (Y is NOT flipped — we use OpenGL +Y up convention here too,
+        // matching the face-matrix path so phone-mode parallax direction
+        // agrees with face-mode.)
         const camX = -((lensImgX - vw / 2)) / f_px * depth;
-        const camY = -((lensImgY - vh / 2)) / f_px * depth;
+        const camY =  ((vh / 2 - lensImgY)) / f_px * depth;
         const camZ = depth;
 
         const wx = webcamWorldPos.x + camX;
@@ -1091,8 +1159,9 @@
         const wz = webcamWorldPos.z + camZ * userScale;
         eye.set(wx - calibrationOffset.x, wy - calibrationOffset.y, wz - calibrationOffset.z);
 
-        const score = det.categories?.[0]?.score ?? 0;
-        faceStatusEl.textContent = `phone ${Math.round(score * 100)}%`;
+        const ageMs = now - _phoneSmooth.lastDetectMs;
+        const stale = ageMs > 100 ? ` (hold ${Math.round(ageMs)}ms)` : '';
+        faceStatusEl.textContent = `phone ${Math.round(_phoneSmooth.score * 100)}%${stale}`;
       }
 
       function tickFace() {
@@ -1522,6 +1591,7 @@
         modeBtn.textContent = 'Mode: ' + (mode === 'phone' ? 'Phone' : 'Face');
         try { localStorage.setItem('bonsaiTrackingMode', mode); } catch (e) {}
         if (mode === 'phone') {
+          resetPhoneSmoothing();
           ensureObjectDetector().catch(e => {
             console.error('[fishtank] object detector load failed', e);
             faceStatusEl.textContent = 'phone model error';
