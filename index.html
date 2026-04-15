@@ -208,8 +208,8 @@
       </div>
       <div class="slider-row">
         <span>Scale</span>
-        <input id="scale" type="range" min="0.2" max="4" step="0.05" value="1.39">
-        <code id="scale-val">1.39</code>
+        <input id="scale" type="range" min="0.2" max="4" step="0.05" value="1.68">
+        <code id="scale-val">1.68</code>
       </div>
       <div class="slider-row">
         <span>Screen W (cm)</span>
@@ -223,8 +223,8 @@
       </div>
       <div class="slider-row">
         <span>Cam height</span>
-        <input id="cam-h" type="range" min="-0.3" max="0.3" step="0.01" value="0">
-        <code id="cam-h-val">0.00</code>
+        <input id="cam-h" type="range" min="-0.3" max="0.3" step="0.01" value="-0.05">
+        <code id="cam-h-val">-0.05</code>
       </div>
       <div class="slider-row">
         <span>Cam pitch</span>
@@ -238,13 +238,13 @@
       </div>
       <div class="slider-row">
         <span>Scene Y</span>
-        <input id="scene-y" type="range" min="-0.5" max="0.5" step="0.01" value="0">
-        <code id="scene-y-val">0.00</code>
+        <input id="scene-y" type="range" min="-0.5" max="0.5" step="0.01" value="-0.02">
+        <code id="scene-y-val">-0.02</code>
       </div>
       <div class="slider-row">
         <span>Scene Z</span>
-        <input id="scene-z" type="range" min="-1.0" max="1.0" step="0.01" value="0.12">
-        <code id="scene-z-val">0.12</code>
+        <input id="scene-z" type="range" min="-1.0" max="1.0" step="0.01" value="-0.09">
+        <code id="scene-z-val">-0.09</code>
       </div>
       <div class="slider-row">
         <span>Scene scale</span>
@@ -253,18 +253,18 @@
       </div>
       <div class="slider-row">
         <span>Tree scale</span>
-        <input id="tree-s" type="range" min="0.1" max="5" step="0.05" value="1.00">
-        <code id="tree-s-val">1.00</code>
+        <input id="tree-s" type="range" min="0.1" max="5" step="0.05" value="1.30">
+        <code id="tree-s-val">1.30</code>
       </div>
       <div class="slider-row">
         <span>Particle scale</span>
-        <input id="part-s" type="range" min="0.1" max="5" step="0.05" value="1.00">
-        <code id="part-s-val">1.00</code>
+        <input id="part-s" type="range" min="0.1" max="5" step="0.05" value="1.80">
+        <code id="part-s-val">1.80</code>
       </div>
       <div class="slider-row">
         <span>Particle size</span>
-        <input id="part-size" type="range" min="0.2" max="4" step="0.05" value="1.00">
-        <code id="part-size-val">1.00</code>
+        <input id="part-size" type="range" min="0.2" max="4" step="0.05" value="0.65">
+        <code id="part-size-val">0.65</code>
       </div>
       <div class="slider-row">
         <span>Letterbox</span>
@@ -273,8 +273,8 @@
       </div>
       <div class="slider-row">
         <span>Box depth (cm)</span>
-        <input id="box-d" type="range" min="5" max="40" step="0.5" value="15">
-        <code id="box-d-val">15</code>
+        <input id="box-d" type="range" min="5" max="40" step="0.5" value="21">
+        <code id="box-d-val">21</code>
       </div>
     </div>
 
@@ -283,7 +283,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 splits + letterbox + hybrid phone</div>
+    <div id="build-stamp">Build 2026-04-14 skylight + box-letterbox align</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -439,34 +439,46 @@
             n = smoothstep(0.35, 1.0, n);
             float edge = smoothstep(0.0, 0.2, vUv.x) * smoothstep(0.0, 0.2, 1.0 - vUv.x);
             float fade = smoothstep(0.0, 0.25, vUv.y) * smoothstep(0.0, 0.4, 1.0 - vUv.y);
-            float a = n * edge * fade * 0.55;
-            gl_FragColor = vec4(uColor * 1.4, a);
+            float a = n * edge * fade * 0.20;   // subtler
+            gl_FragColor = vec4(uColor * 0.95, a);
           }`
       });
 
-      const SHAFT_COUNT = 28;
+      // Skylight model: rays pour DOWN from a window in the ceiling,
+      // positioned in the right third. Origin sits high in local
+      // diorama coords (roughly matching world position (+x/3, +ceiling,
+      // mid-depth) at default scale 0.25). Ray direction slants down-
+      // forward-left so the beams sweep across the bonsai toward the
+      // viewer, giving the scene a natural raking-light feel.
+      const skylightOrigin = new THREE.Vector3(0.32, 0.42, -0.18);
+      const rayDir = new THREE.Vector3(-0.35, -1.0, 0.45).normalize();
+
+      const SHAFT_COUNT = 40;
       const shaftMesh = new THREE.InstancedMesh(
-        new THREE.PlaneGeometry(0.04, 1.0),
+        new THREE.PlaneGeometry(0.05, 1.1),
         shaftMat,
         SHAFT_COUNT
       );
       shaftMesh.frustumCulled = false;
       {
         const dummy = new THREE.Object3D();
-        const up = Math.abs(sunDir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
-        const perpA = new THREE.Vector3().crossVectors(sunDir, up).normalize();
-        const perpB = new THREE.Vector3().crossVectors(sunDir, perpA).normalize();
-        const sunPos = sunDir.clone().multiplyScalar(0.4);
+        const up = Math.abs(rayDir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+        const perpA = new THREE.Vector3().crossVectors(rayDir, up).normalize();
+        const perpB = new THREE.Vector3().crossVectors(rayDir, perpA).normalize();
         for (let i = 0; i < SHAFT_COUNT; i++) {
           const a = Math.random() * Math.PI * 2;
-          const r = Math.random() * 0.16;
-          dummy.position.copy(sunPos);
+          // Wider scatter: radius ~0.32 (was 0.16), with a √ bias so
+          // more rays cluster near the centre and fewer at the edges.
+          const r = Math.sqrt(Math.random()) * 0.32;
+          dummy.position.copy(skylightOrigin);
           dummy.position.add(perpA.clone().multiplyScalar(Math.cos(a) * r));
           dummy.position.add(perpB.clone().multiplyScalar(Math.sin(a) * r));
-          dummy.position.add(sunDir.clone().multiplyScalar(-Math.random() * 0.25));
-          dummy.lookAt(dummy.position.clone().add(sunDir));
+          // Extend DOWN along the ray direction so beams appear to
+          // originate at the skylight and drop through the scene.
+          dummy.position.add(rayDir.clone().multiplyScalar(Math.random() * 0.35));
+          dummy.lookAt(dummy.position.clone().add(rayDir));
           dummy.rotateZ(Math.random() * Math.PI);
-          dummy.scale.set(0.3 + Math.random() * 0.4, 1.2 + Math.random() * 2.0, 1);
+          dummy.scale.set(0.3 + Math.random() * 0.5, 1.0 + Math.random() * 1.8, 1);
           dummy.updateMatrix();
           shaftMesh.setMatrixAt(i, dummy.matrix);
         }
@@ -490,7 +502,7 @@
         uniforms: {
           uTime: { value: 0 },
           uSunDir: { value: sunDir },
-          uSize: { value: 1.0 }
+          uSize: { value: 0.65 }
         },
         vertexShader: `
           uniform float uTime;
@@ -548,13 +560,15 @@
       // own scale sliders so the user can independently tune the bonsai
       // vs the atmospherics.
       const diorama = new THREE.Group();
-      diorama.position.set(0, 0, 0.12);     // default: tree poking forward of screen
+      diorama.position.set(0, -0.02, -0.09);
       diorama.scale.setScalar(0.25);
       scene.add(diorama);
 
       const treeGroup = new THREE.Group();
+      treeGroup.scale.setScalar(1.30);
       diorama.add(treeGroup);
       const particleGroup = new THREE.Group();
+      particleGroup.scale.setScalar(1.80);
       diorama.add(particleGroup);
 
       // -------------------- Window box (shoebox diorama) --------------------
@@ -566,7 +580,7 @@
         color: 0x6e5a3f, roughness: 0.92, metalness: 0.0,
         side: THREE.BackSide
       });
-      let boxDepth = 0.152;       // 6 inches; back wall at z = -boxDepth
+      let boxDepth = 0.21;        // back wall at z = -boxDepth
       let windowBox = null;
       function rebuildWindowBox() {
         if (windowBox) {
@@ -575,7 +589,12 @@
         }
         const w = screen.widthMeters;
         const h = screen.heightMeters;
-        const g = new THREE.BoxGeometry(w, h, boxDepth);
+        // Box inner height shrinks by the letterbox fraction (top + bottom),
+        // so the ceiling and floor of the 3D box land EXACTLY where the
+        // letterbox bars begin. Front-face corners sit at the inner edge
+        // of the letterbox frame.
+        const innerH = h * (1 - 2 * (typeof letterboxFrac !== 'undefined' ? letterboxFrac : 0));
+        const g = new THREE.BoxGeometry(w, innerH, boxDepth);
         windowBox = new THREE.Mesh(g, boxMat);
         // HARD-PIN: front face at z=0 with corners at (±w/2, ±h/2, 0) —
         // identical to the screen rectangle the off-axis projection
@@ -710,7 +729,7 @@
         transparent: true,
         depthWrite: false,
         side: THREE.DoubleSide,
-        uniforms: { uTime: { value: 0 }, uSize: { value: 1.0 } },
+        uniforms: { uTime: { value: 0 }, uSize: { value: 0.65 } },
         vertexShader: `
           uniform float uTime;
           uniform float uSize;
@@ -925,7 +944,7 @@
       // MediaPipe facial-transformation matrix translation is in cm for the
       // canonical metric face model, so 0.01 is the theoretical scale — but
       // webcam calibration varies wildly. A slider lets the user tune.
-      let userScale = 1.39;
+      let userScale = 1.68;
 
       // Position of the webcam in our world coords, defaulting to "directly
       // above the canvas top, in the screen plane". Corner calibration
@@ -1777,7 +1796,7 @@
       // means looking up at it from below. Off-axis projection stays
       // valid because the screen rect is unchanged — we just relocate
       // where the viewer is in front of it.
-      let camHeight = 0;
+      let camHeight = -0.05;
       const camHInput = document.getElementById('cam-h');
       const camHVal = document.getElementById('cam-h-val');
       camHInput.addEventListener('input', () => {
@@ -1805,8 +1824,8 @@
       // positive = poking out toward the viewer.
       const sceneAxes = [
         { axis: 'x', input: 'scene-x', val: 'scene-x-val', initial: 0 },
-        { axis: 'y', input: 'scene-y', val: 'scene-y-val', initial: 0 },
-        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: 0.12 },
+        { axis: 'y', input: 'scene-y', val: 'scene-y-val', initial: -0.02 },
+        { axis: 'z', input: 'scene-z', val: 'scene-z-val', initial: -0.09 },
       ];
       for (const cfg of sceneAxes) {
         diorama.position[cfg.axis] = cfg.initial;
@@ -1865,6 +1884,7 @@
         letterboxFrac = parseFloat(letterboxInput.value);
         letterboxValEl.textContent = letterboxFrac.toFixed(2);
         rebuildLetterbox();
+        rebuildWindowBox();  // box ceiling/floor shrinks with letterbox
       });
 
       // -------------------- Post-processing --------------------
