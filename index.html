@@ -263,7 +263,7 @@
       <div class="dot" id="face-dot"></div>
     </div>
 
-    <div id="build-stamp">Build 2026-04-14 phone mode + hamburger</div>
+    <div id="build-stamp">Build 2026-04-14 Y-axis sign fix</div>
 
     <div id="cal-overlay">
       <div class="cal-corner" id="cal-tl" data-corner="TL"><span class="pin"></span></div>
@@ -1142,11 +1142,16 @@
             _matrixLogged = true;
           }
 
-          // Sign mapping into our world: webcam un-mirrored → image-right
-          // is user-left, so we flip X. Image Y points down; world Y is
-          // up, so we flip Y. Z magnitude is camera-to-face distance.
+          // Sign mapping into our world. MediaPipe's facial transformation
+          // matrix uses an OpenGL-style camera convention (+X right,
+          // +Y UP, +Z out of screen toward viewer). So:
+          //   • tx positive = face on camera's right = user's LEFT, flip → -tx
+          //   • ty positive = face is UP in world (already what we want, NO flip)
+          //   • tz: |tz| is camera-to-face distance
+          // The previous (-ty) flip was wrong; it was hidden by the
+          // lookAt(0,0,0) bug because that view rotation cancelled it out.
           const camX = -tx * u;
-          const camY = -ty * u;
+          const camY = ty * u;
           const camZ = Math.abs(tz) * u;
 
           const wx = webcamWorldPos.x + camX;
@@ -1288,7 +1293,9 @@
         const m = xform.data;
         const tx = m[12], ty = m[13], tz = m[14];
         const u = Math.abs(tz) > 5 ? 0.01 : 1.0;
-        const eyeCam = new THREE.Vector3(-tx * u, -ty * u, Math.abs(tz) * u);
+        // Y is NOT flipped — MediaPipe's matrix uses OpenGL +Y up, same
+        // as our world. See tickFace face-matrix branch for full notes.
+        const eyeCam = new THREE.Vector3(-tx * u, ty * u, Math.abs(tz) * u);
 
         const tip = hand[8], mcp = hand[5];
         if (!tip || !mcp) return null;
